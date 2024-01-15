@@ -14,6 +14,7 @@ fn main() {
         || target.contains("apple-ios")
         || target.contains("apple-tvos")
         || target.contains("apple-watchos")
+        || target.contains("apple-xros")
         || target.contains("uwp")
         || target.contains("windows")
         || target.contains("fuchsia")

@@ -102,6 +102,7 @@ fn pre_link_args(os: &'static str, arch: Arch, abi: &'static str) -> LinkArgs {
         "ios" => ios_lld_platform_version(arch),
         "tvos" => tvos_lld_platform_version(),
         "watchos" => watchos_lld_platform_version(),
+        "xros" => xros_lld_platform_version(),
         "macos" => macos_lld_platform_version(arch),
         _ => unreachable!(),
     }
@@ -192,6 +193,7 @@ pub fn sdk_version(platform: u32) -> Option<(u32, u32)> {
         | object::macho::PLATFORM_TVOSSIMULATOR
         | object::macho::PLATFORM_MACCATALYST => Some((16, 2)),
         object::macho::PLATFORM_WATCHOS | object::macho::PLATFORM_WATCHOSSIMULATOR => Some((9, 1)),
+        object::macho::PLATFORM_XROS | object::macho::PLATFORM_XROSSIMULATOR => Some((1, 0)),
         _ => None,
     }
 }
@@ -206,6 +208,8 @@ pub fn platform(target: &Target) -> Option<u32> {
         ("watchos", _) => object::macho::PLATFORM_WATCHOS,
         ("tvos", "sim") => object::macho::PLATFORM_TVOSSIMULATOR,
         ("tvos", _) => object::macho::PLATFORM_TVOS,
+        ("xros", "sim") => object::macho::PLATFORM_XROSSIMULATOR,
+        ("xros", _) => object::macho::PLATFORM_XROS,
         _ => return None,
     })
 }
@@ -233,6 +237,7 @@ pub fn deployment_target(target: &Target) -> Option<(u32, u32)> {
         },
         "watchos" => watchos_deployment_target(),
         "tvos" => tvos_deployment_target(),
+        "xros" => xros_deployment_target(),
         _ => return None,
     };
 
@@ -288,6 +293,7 @@ fn link_env_remove(arch: Arch, os: &'static str) -> StaticCow<[StaticCow<str>]> 
                 || sdkroot.contains("AppleTVSimulator.platform")
                 || sdkroot.contains("WatchOS.platform")
                 || sdkroot.contains("WatchSimulator.platform")
+                || sdkroot.contains("XROS.platform")
             {
                 env_remove.push("SDKROOT".into())
             }
@@ -297,6 +303,7 @@ fn link_env_remove(arch: Arch, os: &'static str) -> StaticCow<[StaticCow<str>]> 
         // although this is apparently ignored when using the linker at "/usr/bin/ld".
         env_remove.push("IPHONEOS_DEPLOYMENT_TARGET".into());
         env_remove.push("TVOS_DEPLOYMENT_TARGET".into());
+        env_remove.push("XROS_DEPLOYMENT_TARGET".into());
         env_remove.into()
     } else {
         // Otherwise if cross-compiling for a different OS/SDK, remove any part
@@ -376,4 +383,24 @@ fn watchos_lld_platform_version() -> String {
 pub fn watchos_sim_llvm_target(arch: Arch) -> String {
     let (major, minor) = watchos_deployment_target();
     format!("{}-apple-watchos{}.{}.0-simulator", arch.target_name(), major, minor)
+}
+
+fn xros_deployment_target() -> (u32, u32) {
+    // If you are looking for the default deployment target, prefer `rustc --print deployment-target`.
+    from_set_deployment_target("XROS_DEPLOYMENT_TARGET").unwrap_or((1, 0))
+}
+
+fn xros_lld_platform_version() -> String {
+    let (major, minor) = xros_deployment_target();
+    format!("{major}.{minor}")
+}
+
+pub fn xros_llvm_target(arch: Arch) -> String {
+    let (major, minor) = xros_deployment_target();
+    format!("{}-apple-xros{}.{}.0", arch.target_name(), major, minor)
+}
+
+pub fn xros_sim_llvm_target(arch: Arch) -> String {
+    let (major, minor) = xros_deployment_target();
+    format!("{}-apple-xros{}.{}.0-simulator", arch.target_name(), major, minor)
 }
