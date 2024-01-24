@@ -32,8 +32,8 @@
 	shallow = true
 [submodule "src/llvm-project"]
 	path = src/llvm-project
-	url = https://github.com/cyndyishida/llvm-project.git
-	branch = eng/platformsGalore
+	url = https://github.com/agg23/llvm-project.git
+	branch = xrOS-Apple
 	shallow = true
 [submodule "src/doc/embedded-book"]
 	path = src/doc/embedded-book
