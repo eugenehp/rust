@@ -73,9 +73,19 @@ impl UnixListener {
         unsafe {
             let inner = Socket::new_raw(libc::AF_UNIX, libc::SOCK_STREAM)?;
             let (addr, len) = sockaddr_un(path.as_ref())?;
-            #[cfg(any(target_os = "windows", target_os = "redox", target_os = "espidf"))]
+            #[cfg(any(
+                target_os = "windows",
+                target_os = "redox",
+                target_os = "espidf",
+                target_os = "horizon"
+            ))]
             const backlog: libc::c_int = 128;
-            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "macos"
+            ))]
             const backlog: libc::c_int = -1;
             #[cfg(not(any(
                 target_os = "windows",
@@ -83,7 +93,9 @@ impl UnixListener {
                 target_os = "linux",
                 target_os = "freebsd",
                 target_os = "openbsd",
-                target_os = "espidf"
+                target_os = "macos",
+                target_os = "espidf",
+                target_os = "horizon"
             )))]
             const backlog: libc::c_int = libc::SOMAXCONN;
 
@@ -334,6 +346,7 @@ impl From<OwnedFd> for UnixListener {
 
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<UnixListener> for OwnedFd {
+    /// Takes ownership of a [`UnixListener`]'s socket file descriptor.
     #[inline]
     fn from(listener: UnixListener) -> OwnedFd {
         listener.0.into_inner().into_inner()

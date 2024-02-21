@@ -22,6 +22,7 @@ use rustc_middle::ty::{self, List, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::Span;
 
 use rustc_index::{Idx, IndexSlice, IndexVec};
+use rustc_span::source_map::Spanned;
 
 use std::assert_matches::assert_matches;
 use std::cell::Cell;
@@ -445,6 +446,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                 NullOp::SizeOf => {}
                 NullOp::AlignOf => {}
                 NullOp::OffsetOf(_) => {}
+                NullOp::DebugAssertions => {}
             },
 
             Rvalue::ShallowInitBox(_, _) => return Err(Unpromotable),
@@ -565,7 +567,7 @@ impl<'tcx> Validator<'_, 'tcx> {
     fn validate_call(
         &mut self,
         callee: &Operand<'tcx>,
-        args: &[Operand<'tcx>],
+        args: &[Spanned<Operand<'tcx>>],
     ) -> Result<(), Unpromotable> {
         let fn_ty = callee.ty(self.body, self.tcx);
 
@@ -595,7 +597,7 @@ impl<'tcx> Validator<'_, 'tcx> {
 
         self.validate_operand(callee)?;
         for arg in args {
-            self.validate_operand(arg)?;
+            self.validate_operand(&arg.node)?;
         }
 
         Ok(())
@@ -731,7 +733,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
                 } => {
                     self.visit_operand(&mut func, loc);
                     for arg in &mut args {
-                        self.visit_operand(arg, loc);
+                        self.visit_operand(&mut arg.node, loc);
                     }
 
                     let last = self.promoted.basic_blocks.last_index().unwrap();

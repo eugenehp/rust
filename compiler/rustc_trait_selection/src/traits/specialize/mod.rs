@@ -20,13 +20,13 @@ use crate::traits::{
     self, coherence, FutureCompatOverlapErrorKind, ObligationCause, ObligationCtxt,
 };
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_errors::{error_code, DelayDm, Diagnostic};
+use rustc_errors::{codes::*, DelayDm, DiagnosticBuilder, EmissionGuarantee};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::ty::{self, ImplSubject, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::ty::{GenericArgs, GenericArgsRef};
 use rustc_session::lint::builtin::COHERENCE_LEAK_CHECK;
 use rustc_session::lint::builtin::ORDER_DEPENDENT_TRAIT_OBJECTS;
-use rustc_span::{ErrorGuaranteed, Span, DUMMY_SP};
+use rustc_span::{sym, ErrorGuaranteed, Span, DUMMY_SP};
 
 use super::util;
 use super::SelectionContext;
@@ -41,17 +41,17 @@ pub struct OverlapError<'tcx> {
     pub involves_placeholder: bool,
 }
 
-/// Given a subst for the requested impl, translate it to a subst
+/// Given the generic parameters for the requested impl, translate it to the generic parameters
 /// appropriate for the actual item definition (whether it be in that impl,
 /// a parent impl, or the trait).
 ///
 /// When we have selected one impl, but are actually using item definitions from
 /// a parent impl providing a default, we need a way to translate between the
 /// type parameters of the two impls. Here the `source_impl` is the one we've
-/// selected, and `source_args` is a substitution of its generics.
+/// selected, and `source_args` is its generic parameters.
 /// And `target_node` is the impl/trait we're actually going to get the
-/// definition from. The resulting substitution will map from `target_node`'s
-/// generics to `source_impl`'s generics as instantiated by `source_subst`.
+/// definition from. The resulting instantiation will map from `target_node`'s
+/// generics to `source_impl`'s generics as instantiated by `source_args`.
 ///
 /// For example, consider the following scenario:
 ///
@@ -62,7 +62,7 @@ pub struct OverlapError<'tcx> {
 /// ```
 ///
 /// Suppose we have selected "source impl" with `V` instantiated with `u32`.
-/// This function will produce a substitution with `T` and `U` both mapping to `u32`.
+/// This function will produce an instantiation with `T` and `U` both mapping to `u32`.
 ///
 /// where-clauses add some trickiness here, because they can be used to "define"
 /// an argument indirectly:
@@ -72,7 +72,7 @@ pub struct OverlapError<'tcx> {
 ///    where I: Iterator<Item = &'a T>, T: Clone
 /// ```
 ///
-/// In a case like this, the substitution for `T` is determined indirectly,
+/// In a case like this, the instantiation for `T` is determined indirectly,
 /// through associated type projection. We deal with such cases by using
 /// *fulfillment* to relate the two impls, requiring that all projections are
 /// resolved.
@@ -109,7 +109,7 @@ pub fn translate_args_with_cause<'tcx>(
     let source_trait_ref =
         infcx.tcx.impl_trait_ref(source_impl).unwrap().instantiate(infcx.tcx, source_args);
 
-    // translate the Self and Param parts of the substitution, since those
+    // translate the Self and Param parts of the generic parameters, since those
     // vary across impls
     let target_args = match target_node {
         specialization_graph::Node::Impl(target_impl) => {
@@ -121,8 +121,8 @@ pub fn translate_args_with_cause<'tcx>(
             fulfill_implication(infcx, param_env, source_trait_ref, source_impl, target_impl, cause)
                 .unwrap_or_else(|()| {
                     bug!(
-                        "When translating substitutions from {source_impl:?} to {target_impl:?}, \
-                        the expected specialization failed to hold"
+                        "When translating generic parameters from {source_impl:?} to \
+                        {target_impl:?}, the expected specialization failed to hold"
                     )
                 })
         }
@@ -142,11 +142,33 @@ pub fn translate_args_with_cause<'tcx>(
 pub(super) fn specializes(tcx: TyCtxt<'_>, (impl1_def_id, impl2_def_id): (DefId, DefId)) -> bool {
     // The feature gate should prevent introducing new specializations, but not
     // taking advantage of upstream ones.
+    // If specialization is enabled for this crate then no extra checks are needed.
+    // If it's not, and either of the `impl`s is local to this crate, then this definitely
+    // isn't specializing - unless specialization is enabled for the `impl` span,
+    // e.g. if it comes from an `allow_internal_unstable` macro
     let features = tcx.features();
     let specialization_enabled = features.specialization || features.min_specialization;
-    if !specialization_enabled && (impl1_def_id.is_local() || impl2_def_id.is_local()) {
-        return false;
+    if !specialization_enabled {
+        if impl1_def_id.is_local() {
+            let span = tcx.def_span(impl1_def_id);
+            if !span.allows_unstable(sym::specialization)
+                && !span.allows_unstable(sym::min_specialization)
+            {
+                return false;
+            }
+        }
+
+        if impl2_def_id.is_local() {
+            let span = tcx.def_span(impl2_def_id);
+            if !span.allows_unstable(sym::specialization)
+                && !span.allows_unstable(sym::min_specialization)
+            {
+                return false;
+            }
+        }
     }
+
+    let impl1_trait_header = tcx.impl_trait_header(impl1_def_id).unwrap().instantiate_identity();
 
     // We determine whether there's a subset relationship by:
     //
@@ -161,26 +183,30 @@ pub(super) fn specializes(tcx: TyCtxt<'_>, (impl1_def_id, impl2_def_id): (DefId,
     // See RFC 1210 for more details and justification.
 
     // Currently we do not allow e.g., a negative impl to specialize a positive one
-    if tcx.impl_polarity(impl1_def_id) != tcx.impl_polarity(impl2_def_id) {
+    if impl1_trait_header.polarity != tcx.impl_polarity(impl2_def_id) {
         return false;
     }
 
     // create a parameter environment corresponding to a (placeholder) instantiation of impl1
     let penv = tcx.param_env(impl1_def_id);
-    let impl1_trait_ref = tcx.impl_trait_ref(impl1_def_id).unwrap().instantiate_identity();
 
     // Create an infcx, taking the predicates of impl1 as assumptions:
     let infcx = tcx.infer_ctxt().build();
 
     // Attempt to prove that impl2 applies, given all of the above.
-    fulfill_implication(&infcx, penv, impl1_trait_ref, impl1_def_id, impl2_def_id, |_, _| {
-        ObligationCause::dummy()
-    })
+    fulfill_implication(
+        &infcx,
+        penv,
+        impl1_trait_header.trait_ref,
+        impl1_def_id,
+        impl2_def_id,
+        |_, _| ObligationCause::dummy(),
+    )
     .is_ok()
 }
 
 /// Attempt to fulfill all obligations of `target_impl` after unification with
-/// `source_trait_ref`. If successful, returns a substitution for *all* the
+/// `source_trait_ref`. If successful, returns the generic parameters for *all* the
 /// generics of `target_impl`, including both those needed to unify with
 /// `source_trait_ref` and those whose identity is determined via a where
 /// clause in the impl.
@@ -227,7 +253,7 @@ fn fulfill_implication<'tcx>(
     };
 
     // Needs to be `in_snapshot` because this function is used to rebase
-    // substitutions, which may happen inside of a select within a probe.
+    // generic parameters, which may happen inside of a select within a probe.
     let ocx = ObligationCtxt::new(infcx);
     // attempt to prove all of the predicates for impl2 given those for impl1
     // (which are packed up in penv)
@@ -249,7 +275,7 @@ fn fulfill_implication<'tcx>(
 
     debug!("fulfill_implication: an impl for {:?} specializes {:?}", source_trait, target_trait);
 
-    // Now resolve the *substitution* we built for the target earlier, replacing
+    // Now resolve the *generic parameters* we built for the target earlier, replacing
     // the inference variables inside with whatever we got from fulfillment.
     Ok(infcx.resolve_vars_if_possible(target_args))
 }
@@ -367,13 +393,13 @@ fn report_conflicting_impls<'tcx>(
     let impl_span = tcx.def_span(impl_def_id);
 
     // Work to be done after we've built the DiagnosticBuilder. We have to define it
-    // now because the struct_lint methods don't return back the DiagnosticBuilder
+    // now because the lint emit methods don't return back the DiagnosticBuilder
     // that's passed in.
-    fn decorate<'tcx>(
+    fn decorate<'tcx, G: EmissionGuarantee>(
         tcx: TyCtxt<'tcx>,
         overlap: &OverlapError<'tcx>,
         impl_span: Span,
-        err: &mut Diagnostic,
+        err: &mut DiagnosticBuilder<'_, G>,
     ) {
         if (overlap.trait_ref, overlap.self_ty).references_error() {
             err.downgrade_to_delayed_bug();
@@ -426,10 +452,10 @@ fn report_conflicting_impls<'tcx>(
     match used_to_be_allowed {
         None => {
             let reported = if overlap.with_impl.is_local()
-                || tcx.orphan_check_impl(impl_def_id).is_ok()
+                || tcx.ensure().orphan_check_impl(impl_def_id).is_ok()
             {
                 let mut err = tcx.dcx().struct_span_err(impl_span, msg);
-                err.code(error_code!(E0119));
+                err.code(E0119);
                 decorate(tcx, &overlap, impl_span, &mut err);
                 err.emit()
             } else {
@@ -442,7 +468,7 @@ fn report_conflicting_impls<'tcx>(
                 FutureCompatOverlapErrorKind::Issue33140 => ORDER_DEPENDENT_TRAIT_OBJECTS,
                 FutureCompatOverlapErrorKind::LeakCheck => COHERENCE_LEAK_CHECK,
             };
-            tcx.struct_span_lint_hir(
+            tcx.node_span_lint(
                 lint,
                 tcx.local_def_id_to_hir_id(impl_def_id),
                 impl_span,
@@ -496,7 +522,8 @@ pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Opti
     for (p, _) in predicates {
         if let Some(poly_trait_ref) = p.as_trait_clause() {
             if Some(poly_trait_ref.def_id()) == sized_trait {
-                types_without_default_bounds.remove(&poly_trait_ref.self_ty().skip_binder());
+                // FIXME(#120456) - is `swap_remove` correct?
+                types_without_default_bounds.swap_remove(&poly_trait_ref.self_ty().skip_binder());
                 continue;
             }
         }

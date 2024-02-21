@@ -8,15 +8,21 @@ ast_lowering_arbitrary_expression_in_pattern =
 
 ast_lowering_argument = argument
 
+ast_lowering_assoc_ty_binding_in_dyn =
+    associated type bounds are not allowed in `dyn` types
+    .suggestion = use `impl Trait` to introduce a type instead
+
 ast_lowering_assoc_ty_parentheses =
     parenthesized generic arguments cannot be used in associated type constraints
 
+ast_lowering_async_bound_not_on_trait =
+    `async` bound modifier only allowed on trait, not `{$descr}`
+
+ast_lowering_async_bound_only_for_fn_traits =
+    `async` bound modifier only allowed on `Fn`/`FnMut`/`FnOnce` traits
+
 ast_lowering_async_coroutines_not_supported =
     `async` coroutines are not yet supported
-
-ast_lowering_async_non_move_closure_not_supported =
-    `async` non-`move` closures with parameters are not currently supported
-    .help = consider using `let` statements to manually capture variables by reference before entering an `async move` closure
 
 ast_lowering_att_syntax_only_x86 =
     the `att_syntax` option is only supported on x86
@@ -98,9 +104,6 @@ ast_lowering_match_arm_with_no_body =
     `match` arm with no body
     .suggestion = add a body after the pattern
 
-ast_lowering_misplaced_assoc_ty_binding =
-    associated type bounds are only allowed in where clauses and function signatures, not in {$position}
-
 ast_lowering_misplaced_double_dot =
     `..` patterns are not allowed here
     .note = only allowed in tuple, tuple struct, and slice patterns
@@ -120,9 +123,6 @@ ast_lowering_never_pattern_with_body =
 ast_lowering_never_pattern_with_guard =
     a guard on a never pattern will never be run
     .suggestion = remove this guard
-
-ast_lowering_not_supported_for_lifetime_binder_async_closure =
-    `for<...>` binders on `async` closures are not currently supported
 
 ast_lowering_previously_used_here = previously used here
 

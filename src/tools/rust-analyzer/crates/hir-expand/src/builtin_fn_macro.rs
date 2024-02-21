@@ -6,18 +6,16 @@ use either::Either;
 use itertools::Itertools;
 use mbe::{parse_exprs_with_sep, parse_to_token_tree};
 use span::{Span, SpanAnchor, SyntaxContextId, ROOT_ERASED_FILE_AST_ID};
-use syntax::{
-    ast::{self, AstToken},
-    SmolStr,
-};
+use syntax::ast::{self, AstToken};
 
 use crate::{
     db::ExpandDatabase,
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt},
     name::{self, known},
     quote,
+    quote::dollar_crate,
     tt::{self, DelimSpan},
-    ExpandError, ExpandResult, HirFileIdExt, MacroCallId,
+    ExpandError, ExpandResult, HirFileIdExt, MacroCallId, MacroFileIdExt,
 };
 
 macro_rules! register_builtin {
@@ -127,7 +125,7 @@ fn mk_pound(span: Span) -> tt::Subtree {
         vec![crate::tt::Leaf::Punct(crate::tt::Punct {
             char: '#',
             spacing: crate::tt::Spacing::Alone,
-            span: span,
+            span,
         })
         .into()],
         span,
@@ -157,10 +155,10 @@ fn line_expand(
     // not incremental
     ExpandResult::ok(tt::Subtree {
         delimiter: tt::Delimiter::invisible_spanned(span),
-        token_trees: vec![tt::TokenTree::Leaf(tt::Leaf::Literal(tt::Literal {
+        token_trees: Box::new([tt::TokenTree::Leaf(tt::Leaf::Literal(tt::Literal {
             text: "0u32".into(),
             span,
-        }))],
+        }))]),
     })
 }
 
@@ -205,16 +203,16 @@ fn assert_expand(
 ) -> ExpandResult<tt::Subtree> {
     let call_site_span = span_with_call_site_ctxt(db, span, id);
     let args = parse_exprs_with_sep(tt, ',', call_site_span);
-    let dollar_crate = tt::Ident { text: SmolStr::new_inline("$crate"), span };
+    let dollar_crate = dollar_crate(span);
     let expanded = match &*args {
         [cond, panic_args @ ..] => {
             let comma = tt::Subtree {
                 delimiter: tt::Delimiter::invisible_spanned(call_site_span),
-                token_trees: vec![tt::TokenTree::Leaf(tt::Leaf::Punct(tt::Punct {
+                token_trees: Box::new([tt::TokenTree::Leaf(tt::Leaf::Punct(tt::Punct {
                     char: ',',
                     spacing: tt::Spacing::Alone,
                     span: call_site_span,
-                }))],
+                }))]),
             };
             let cond = cond.clone();
             let panic_args = itertools::Itertools::intersperse(panic_args.iter().cloned(), comma);
@@ -281,9 +279,9 @@ fn format_args_expand_general(
     let pound = mk_pound(span);
     let mut tt = tt.clone();
     tt.delimiter.kind = tt::DelimiterKind::Parenthesis;
-    return ExpandResult::ok(quote! {span =>
+    ExpandResult::ok(quote! {span =>
         builtin #pound format_args #tt
-    });
+    })
 }
 
 fn asm_expand(
@@ -300,7 +298,7 @@ fn asm_expand(
             [tt::TokenTree::Leaf(tt::Leaf::Literal(lit))]
             | [tt::TokenTree::Leaf(tt::Leaf::Literal(lit)), tt::TokenTree::Leaf(tt::Leaf::Punct(tt::Punct { char: ',', span: _, spacing: _ }))] =>
             {
-                let dollar_krate = tt::Ident { text: SmolStr::new_inline("$crate"), span };
+                let dollar_krate = dollar_crate(span);
                 literals.push(quote!(span=>#dollar_krate::format_args!(#lit);));
             }
             _ => break,
@@ -345,7 +343,7 @@ fn panic_expand(
     tt: &tt::Subtree,
     span: Span,
 ) -> ExpandResult<tt::Subtree> {
-    let dollar_crate = tt::Ident { text: SmolStr::new_inline("$crate"), span };
+    let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id);
 
     let mac =
@@ -361,7 +359,10 @@ fn panic_expand(
         close: call_site_span,
         kind: tt::DelimiterKind::Parenthesis,
     };
-    call.token_trees.push(tt::TokenTree::Subtree(subtree));
+
+    // FIXME(slow): quote! have a way to expand to builder to make this a vec!
+    call.push(tt::TokenTree::Subtree(subtree));
+
     ExpandResult::ok(call)
 }
 
@@ -371,7 +372,7 @@ fn unreachable_expand(
     tt: &tt::Subtree,
     span: Span,
 ) -> ExpandResult<tt::Subtree> {
-    let dollar_crate = tt::Ident { text: SmolStr::new_inline("$crate"), span };
+    let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id);
 
     let mac = if use_panic_2021(db, call_site_span) {
@@ -390,10 +391,14 @@ fn unreachable_expand(
         close: call_site_span,
         kind: tt::DelimiterKind::Parenthesis,
     };
-    call.token_trees.push(tt::TokenTree::Subtree(subtree));
+
+    // FIXME(slow): quote! have a way to expand to builder to make this a vec!
+    call.push(tt::TokenTree::Subtree(subtree));
+
     ExpandResult::ok(call)
 }
 
+#[allow(clippy::never_loop)]
 fn use_panic_2021(db: &dyn ExpandDatabase, span: Span) -> bool {
     // To determine the edition, we check the first span up the expansion
     // stack that does not have #[allow_internal_unstable(edition_panic)].
@@ -441,7 +446,7 @@ fn compile_error_expand(
 ) -> ExpandResult<tt::Subtree> {
     let err = match &*tt.token_trees {
         [tt::TokenTree::Leaf(tt::Leaf::Literal(it))] => match unquote_str(it) {
-            Some(unquoted) => ExpandError::other(unquoted),
+            Some(unquoted) => ExpandError::other(unquoted.into_boxed_str()),
             None => ExpandError::other("`compile_error!` argument must be a string"),
         },
         _ => ExpandError::other("`compile_error!` argument must be a string"),
@@ -510,7 +515,7 @@ fn concat_bytes_expand(
             tt::TokenTree::Leaf(tt::Leaf::Literal(lit)) => {
                 let token = ast::make::tokens::literal(&lit.to_string());
                 match token.kind() {
-                    syntax::SyntaxKind::BYTE => bytes.push(token.text().to_string()),
+                    syntax::SyntaxKind::BYTE => bytes.push(token.text().to_owned()),
                     syntax::SyntaxKind::BYTE_STRING => {
                         let components = unquote_byte_string(lit).unwrap_or_default();
                         components.into_iter().for_each(|it| bytes.push(it.to_string()));
@@ -565,7 +570,7 @@ fn concat_bytes_expand_subtree(
                 let lit = ast::make::tokens::literal(&lit.to_string());
                 match lit.kind() {
                     syntax::SyntaxKind::BYTE | syntax::SyntaxKind::INT_NUMBER => {
-                        bytes.push(lit.text().to_string())
+                        bytes.push(lit.text().to_owned())
                     }
                     _ => {
                         return Err(mbe::ExpandError::UnexpectedToken.into());
@@ -611,7 +616,7 @@ fn relative_file(
     path_str: &str,
     allow_recursion: bool,
 ) -> Result<FileId, ExpandError> {
-    let call_site = call_id.as_file().original_file(db);
+    let call_site = call_id.as_macro_file().parent(db).original_file_respecting_includes(db);
     let path = AnchoredPath { anchor: call_site, path: path_str };
     let res = db
         .resolve_path(path)
@@ -626,7 +631,7 @@ fn relative_file(
 
 fn parse_string(tt: &tt::Subtree) -> Result<String, ExpandError> {
     tt.token_trees
-        .get(0)
+        .first()
         .and_then(|tt| match tt {
             tt::TokenTree::Leaf(tt::Leaf::Literal(it)) => unquote_str(it),
             _ => None,
@@ -676,10 +681,10 @@ fn include_bytes_expand(
     // FIXME: actually read the file here if the user asked for macro expansion
     let res = tt::Subtree {
         delimiter: tt::Delimiter::invisible_spanned(span),
-        token_trees: vec![tt::TokenTree::Leaf(tt::Leaf::Literal(tt::Literal {
+        token_trees: Box::new([tt::TokenTree::Leaf(tt::Leaf::Literal(tt::Literal {
             text: r#"b"""#.into(),
             span,
-        }))],
+        }))]),
     };
     ExpandResult::ok(res)
 }
@@ -744,7 +749,7 @@ fn env_expand(
         // We cannot use an empty string here, because for
         // `include!(concat!(env!("OUT_DIR"), "/foo.rs"))` will become
         // `include!("foo.rs"), which might go to infinite loop
-        "UNRESOLVED_ENV_VAR".to_string()
+        "UNRESOLVED_ENV_VAR".to_owned()
     });
     let expanded = quote! {span => #s };
 
@@ -763,10 +768,10 @@ fn option_env_expand(
             return ExpandResult::new(tt::Subtree::empty(DelimSpan { open: span, close: span }), e)
         }
     };
-    // FIXME: Use `DOLLAR_CRATE` when that works in eager macros.
+    let dollar_crate = dollar_crate(span);
     let expanded = match get_env_inner(db, arg_id, &key) {
-        None => quote! {span => ::core::option::Option::None::<&str> },
-        Some(s) => quote! {span => ::core::option::Option::Some(#s) },
+        None => quote! {span => #dollar_crate::option::Option::None::<&str> },
+        Some(s) => quote! {span => #dollar_crate::option::Option::Some(#s) },
     };
 
     ExpandResult::ok(expanded)

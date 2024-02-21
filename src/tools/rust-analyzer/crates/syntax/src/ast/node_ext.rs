@@ -53,6 +53,12 @@ fn text_of_first_token(node: &SyntaxNode) -> TokenText<'_> {
     }
 }
 
+impl ast::Abi {
+    pub fn abi_string(&self) -> Option<ast::String> {
+        support::token(&self.syntax, SyntaxKind::STRING).and_then(ast::String::cast)
+    }
+}
+
 impl ast::HasModuleItem for ast::StmtList {}
 
 impl ast::BlockExpr {
@@ -285,23 +291,21 @@ impl ast::Path {
         self.first_qualifier_or_self().segment()
     }
 
-    // FIXME: Check usages of Self::segments, they might be wrong because of the logic of the bloew function
-    pub fn segments_of_this_path_only_rev(&self) -> impl Iterator<Item = ast::PathSegment> + Clone {
-        self.qualifiers_and_self().filter_map(|it| it.segment())
-    }
-
     pub fn segments(&self) -> impl Iterator<Item = ast::PathSegment> + Clone {
-        successors(self.first_segment(), |p| {
-            p.parent_path().parent_path().and_then(|p| p.segment())
+        let path_range = self.syntax().text_range();
+        successors(self.first_segment(), move |p| {
+            p.parent_path().parent_path().and_then(|p| {
+                if path_range.contains_range(p.syntax().text_range()) {
+                    p.segment()
+                } else {
+                    None
+                }
+            })
         })
     }
 
     pub fn qualifiers(&self) -> impl Iterator<Item = ast::Path> + Clone {
         successors(self.qualifier(), |p| p.qualifier())
-    }
-
-    pub fn qualifiers_and_self(&self) -> impl Iterator<Item = ast::Path> + Clone {
-        successors(Some(self.clone()), |p| p.qualifier())
     }
 
     pub fn top_path(&self) -> ast::Path {
@@ -328,6 +332,14 @@ impl ast::UseTree {
 
     pub fn parent_use_tree_list(&self) -> Option<ast::UseTreeList> {
         self.syntax().parent().and_then(ast::UseTreeList::cast)
+    }
+
+    pub fn top_use_tree(&self) -> ast::UseTree {
+        let mut this = self.clone();
+        while let Some(use_tree_list) = this.parent_use_tree_list() {
+            this = use_tree_list.parent_use_tree();
+        }
+        this
     }
 }
 
@@ -358,8 +370,12 @@ impl ast::UseTreeList {
         let remove_brace_in_use_tree_list = |u: &ast::UseTreeList| {
             let use_tree_count = u.use_trees().count();
             if use_tree_count == 1 {
-                u.l_curly_token().map(ted::remove);
-                u.r_curly_token().map(ted::remove);
+                if let Some(a) = u.l_curly_token() {
+                    ted::remove(a)
+                }
+                if let Some(a) = u.r_curly_token() {
+                    ted::remove(a)
+                }
                 u.comma().for_each(ted::remove);
             }
         };
@@ -368,7 +384,7 @@ impl ast::UseTreeList {
         // the below remove the innermost {}, got `use crate::{{{A}}}`
         remove_brace_in_use_tree_list(&self);
 
-        // the below remove othe unnecessary {}, got `use crate::A`
+        // the below remove other unnecessary {}, got `use crate::A`
         while let Some(parent_use_tree_list) = self.parent_use_tree().parent_use_tree_list() {
             remove_brace_in_use_tree_list(&parent_use_tree_list);
             self = parent_use_tree_list;
@@ -437,6 +453,12 @@ impl StructKind {
 }
 
 impl ast::Struct {
+    pub fn kind(&self) -> StructKind {
+        StructKind::from_node(self)
+    }
+}
+
+impl ast::Union {
     pub fn kind(&self) -> StructKind {
         StructKind::from_node(self)
     }
@@ -543,6 +565,26 @@ impl fmt::Display for NameOrNameRef {
         match self {
             NameOrNameRef::Name(it) => fmt::Display::fmt(it, f),
             NameOrNameRef::NameRef(it) => fmt::Display::fmt(it, f),
+        }
+    }
+}
+
+impl ast::AstNode for NameOrNameRef {
+    fn can_cast(kind: SyntaxKind) -> bool {
+        matches!(kind, SyntaxKind::NAME | SyntaxKind::NAME_REF)
+    }
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        let res = match syntax.kind() {
+            SyntaxKind::NAME => NameOrNameRef::Name(ast::Name { syntax }),
+            SyntaxKind::NAME_REF => NameOrNameRef::NameRef(ast::NameRef { syntax }),
+            _ => return None,
+        };
+        Some(res)
+    }
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            NameOrNameRef::NameRef(it) => it.syntax(),
+            NameOrNameRef::Name(it) => it.syntax(),
         }
     }
 }

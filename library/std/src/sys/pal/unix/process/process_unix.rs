@@ -1,11 +1,10 @@
 use crate::fmt;
 use crate::io::{self, Error, ErrorKind};
 use crate::mem;
-use crate::num::NonZeroI32;
+use crate::num::NonZero;
 use crate::sys;
 use crate::sys::cvt;
 use crate::sys::process::process_common::*;
-use core::ffi::NonZero_c_int;
 
 #[cfg(target_os = "linux")]
 use crate::os::linux::process::PidFd;
@@ -148,8 +147,7 @@ impl Command {
         #[cfg(not(target_os = "linux"))]
         let pidfd = -1;
 
-        // Safety: We obtained the pidfd from calling `clone3` with
-        // `CLONE_PIDFD` so it's valid an otherwise unowned.
+        // Safety: We obtained the pidfd (on Linux) using SOCK_SEQPACKET, so it's valid.
         let mut p = unsafe { Process::new(pid, pidfd) };
         let mut bytes = [0; 8];
 
@@ -937,7 +935,7 @@ impl ExitStatus {
         // https://pubs.opengroup.org/onlinepubs/9699919799/functions/wait.html. If it is not
         // true for a platform pretending to be Unix, the tests (our doctests, and also
         // process_unix/tests.rs) will spot it. `ExitStatusError::code` assumes this too.
-        match NonZero_c_int::try_from(self.0) {
+        match NonZero::try_from(self.0) {
             /* was nonzero */ Ok(failure) => Err(ExitStatusError(failure)),
             /* was zero, couldn't convert */ Err(_) => Ok(()),
         }
@@ -1094,7 +1092,7 @@ impl fmt::Display for ExitStatus {
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
-pub struct ExitStatusError(NonZero_c_int);
+pub struct ExitStatusError(NonZero<c_int>);
 
 impl Into<ExitStatus> for ExitStatusError {
     fn into(self) -> ExitStatus {
@@ -1109,7 +1107,7 @@ impl fmt::Debug for ExitStatusError {
 }
 
 impl ExitStatusError {
-    pub fn code(self) -> Option<NonZeroI32> {
+    pub fn code(self) -> Option<NonZero<i32>> {
         ExitStatus(self.0.into()).code().map(|st| st.try_into().unwrap())
     }
 }

@@ -1,4 +1,4 @@
-// check-pass
+//@ check-pass
 
 #![crate_type = "lib"]
 #![feature(no_core, lang_items, unboxed_closures, auto_traits, intrinsics, rustc_attrs, staged_api)]
@@ -506,9 +506,6 @@ trait Clone: Sized {
 
 #[lang = "structural_peq"]
 trait StructuralPartialEq {}
-
-#[lang = "structural_teq"]
-trait StructuralEq {}
 
 const fn drop<T: ~const Destruct>(_: T) {}
 

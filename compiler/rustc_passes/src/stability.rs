@@ -27,7 +27,7 @@ use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
 
 use std::mem::replace;
-use std::num::NonZeroU32;
+use std::num::NonZero;
 
 #[derive(PartialEq)]
 enum AnnotationKind {
@@ -122,7 +122,7 @@ impl<'a, 'tcx> Annotator<'a, 'tcx> {
 
             if matches!(kind, AnnotationKind::Prohibited | AnnotationKind::DeprecationProhibited) {
                 let hir_id = self.tcx.local_def_id_to_hir_id(def_id);
-                self.tcx.emit_spanned_lint(
+                self.tcx.emit_node_span_lint(
                     USELESS_DEPRECATED,
                     hir_id,
                     *span,
@@ -645,7 +645,7 @@ fn stability_index(tcx: TyCtxt<'_>, (): ()) -> Index {
             let stability = Stability {
                 level: attr::StabilityLevel::Unstable {
                     reason: UnstableReason::Default,
-                    issue: NonZeroU32::new(27812),
+                    issue: NonZero::new(27812),
                     is_soft: false,
                     implied_by: None,
                 },
@@ -739,7 +739,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'tcx> {
                         // do not lint when the trait isn't resolved, since resolution error should
                         // be fixed first
                         if t.path.res != Res::Err && c.fully_stable {
-                            self.tcx.emit_spanned_lint(
+                            self.tcx.emit_node_span_lint(
                                 INEFFECTIVE_UNSTABLE_TRAIT_IMPL,
                                 item.hir_id(),
                                 span,
@@ -957,8 +957,9 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
     // available as we'd like it to be.
     // FIXME: only remove `libc` when `stdbuild` is active.
     // FIXME: remove special casing for `test`.
-    remaining_lib_features.remove(&sym::libc);
-    remaining_lib_features.remove(&sym::test);
+    // FIXME(#120456) - is `swap_remove` correct?
+    remaining_lib_features.swap_remove(&sym::libc);
+    remaining_lib_features.swap_remove(&sym::test);
 
     /// For each feature in `defined_features`..
     ///
@@ -996,7 +997,8 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
                     unnecessary_stable_feature_lint(tcx, *span, feature, since);
                 }
             }
-            remaining_lib_features.remove(&feature);
+            // FIXME(#120456) - is `swap_remove` correct?
+            remaining_lib_features.swap_remove(&feature);
 
             // `feature` is the feature doing the implying, but `implied_by` is the feature with
             // the attribute that establishes this relationship. `implied_by` is guaranteed to be a
@@ -1073,7 +1075,7 @@ fn unnecessary_partially_stable_feature_lint(
     implies: Symbol,
     since: Symbol,
 ) {
-    tcx.emit_spanned_lint(
+    tcx.emit_node_span_lint(
         lint::builtin::STABLE_FEATURES,
         hir::CRATE_HIR_ID,
         span,
@@ -1096,7 +1098,7 @@ fn unnecessary_stable_feature_lint(
     if since.as_str() == VERSION_PLACEHOLDER {
         since = sym::env_CFG_RELEASE;
     }
-    tcx.emit_spanned_lint(
+    tcx.emit_node_span_lint(
         lint::builtin::STABLE_FEATURES,
         hir::CRATE_HIR_ID,
         span,

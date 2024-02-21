@@ -1,10 +1,10 @@
 use clippy_utils::diagnostics::span_lint_hir_and_then;
+use clippy_utils::numeric_literal;
 use clippy_utils::source::snippet_opt;
-use clippy_utils::{get_parent_node, numeric_literal};
 use rustc_ast::ast::{LitFloatType, LitIntType, LitKind};
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::{walk_expr, walk_stmt, Visitor};
-use rustc_hir::{Block, Body, Expr, ExprKind, FnRetTy, HirId, ItemKind, Lit, Node, Stmt, StmtKind};
+use rustc_hir::{Block, Body, ConstContext, Expr, ExprKind, FnRetTy, HirId, Lit, Stmt, StmtKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty::{self, FloatTy, IntTy, PolyFnSig, Ty};
@@ -50,11 +50,11 @@ declare_lint_pass!(DefaultNumericFallback => [DEFAULT_NUMERIC_FALLBACK]);
 
 impl<'tcx> LateLintPass<'tcx> for DefaultNumericFallback {
     fn check_body(&mut self, cx: &LateContext<'tcx>, body: &'tcx Body<'_>) {
-        let is_parent_const = if let Some(Node::Item(item)) = get_parent_node(cx.tcx, body.id().hir_id) {
-            matches!(item.kind, ItemKind::Const(..))
-        } else {
-            false
-        };
+        let hir = cx.tcx.hir();
+        let is_parent_const = matches!(
+            hir.body_const_context(hir.body_owner_def_id(body.id())),
+            Some(ConstContext::Const { inline: false } | ConstContext::Static(_))
+        );
         let mut visitor = NumericFallbackVisitor::new(cx, is_parent_const);
         visitor.visit_body(body);
     }
@@ -128,8 +128,7 @@ impl<'a, 'tcx> Visitor<'tcx> for NumericFallbackVisitor<'a, 'tcx> {
                 },
                 _,
             ) => {
-                if let Some(parent) = self.cx.tcx.hir().find_parent(expr.hir_id)
-                    && let Some(fn_sig) = parent.fn_sig()
+                if let Some(fn_sig) = self.cx.tcx.parent_hir_node(expr.hir_id).fn_sig()
                     && let FnRetTy::Return(_ty) = fn_sig.decl.output
                 {
                     // We cannot check the exact type since it's a `hir::Ty`` which does not implement `is_numeric`

@@ -53,6 +53,7 @@ bitflags::bitflags! {
         const CONST_EXPR        = 1 << 2;
         const ALLOW_LET         = 1 << 3;
         const IN_IF_GUARD       = 1 << 4;
+        const IS_PAT            = 1 << 5;
     }
 }
 
@@ -1458,7 +1459,7 @@ impl<'a> Parser<'a> {
         match self.parse_str_lit() {
             Ok(str_lit) => Some(str_lit),
             Err(Some(lit)) => match lit.kind {
-                ast::LitKind::Err => None,
+                ast::LitKind::Err(_) => None,
                 _ => {
                     self.dcx().emit_err(NonStringAbiLiteral { span: lit.span });
                     None

@@ -5,7 +5,7 @@
 //
 // See discussion on rust-lang/rust#62307 and rust-lang/rust#62339
 #![warn(indirect_structural_match)]
-// run-pass
+//@ run-pass
 
 struct NoDerive(#[allow(dead_code)] i32);
 
@@ -22,7 +22,7 @@ const WRAP_INDIRECT_INLINE: & &WrapInline = & &WrapInline(NoDerive(0));
 fn main() {
     match WRAP_INDIRECT_INLINE {
         WRAP_INDIRECT_INLINE => { panic!("WRAP_INDIRECT_INLINE matched itself"); }
-        //~^ WARN must be annotated with `#[derive(PartialEq, Eq)]`
+        //~^ WARN must be annotated with `#[derive(PartialEq)]`
         //~| WARN this was previously accepted
         _ => { println!("WRAP_INDIRECT_INLINE did not match itself"); }
     }

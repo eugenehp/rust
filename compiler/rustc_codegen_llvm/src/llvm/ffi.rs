@@ -106,7 +106,6 @@ pub enum CallConv {
     X86_Intr = 83,
     AvrNonBlockingInterrupt = 84,
     AvrInterrupt = 85,
-    AmdGpuKernel = 91,
 }
 
 /// LLVMRustLinkage
@@ -185,7 +184,6 @@ pub enum AttributeKind {
     SanitizeMemory = 22,
     NonLazyBind = 23,
     OptimizeNone = 24,
-    ReturnsTwice = 25,
     ReadNone = 26,
     SanitizeHWAddress = 28,
     WillReturn = 29,
@@ -1620,6 +1618,7 @@ extern "C" {
     ) -> &'a Value;
 
     pub fn LLVMRustSetFastMath(Instr: &Value);
+    pub fn LLVMRustSetAlgebraicMath(Instr: &Value);
 
     // Miscellaneous instructions
     pub fn LLVMRustGetInstrProfIncrementIntrinsic(M: &Module) -> &Value;

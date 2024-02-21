@@ -156,7 +156,7 @@ where
         placed
     };
 
-    // Merge until we have at most `max_cgu_count` codegen units.
+    // Merge until we don't exceed the max CGU count.
     // `merge_codegen_units` is responsible for updating the CGU size
     // estimates.
     {
@@ -182,7 +182,7 @@ where
     }
 
     // Ensure CGUs are sorted by name, so that we get deterministic results.
-    if !codegen_units.is_sorted_by(|a, b| Some(a.name().as_str().cmp(b.name().as_str()))) {
+    if !codegen_units.is_sorted_by(|a, b| a.name().as_str() <= b.name().as_str()) {
         let mut names = String::new();
         for cgu in codegen_units.iter() {
             names += &format!("- {}\n", cgu.name());
@@ -317,7 +317,7 @@ fn merge_codegen_units<'tcx>(
     assert!(cx.tcx.sess.codegen_units().as_usize() >= 1);
 
     // A sorted order here ensures merging is deterministic.
-    assert!(codegen_units.is_sorted_by(|a, b| Some(a.name().as_str().cmp(b.name().as_str()))));
+    assert!(codegen_units.is_sorted_by(|a, b| a.name().as_str() <= b.name().as_str()));
 
     // This map keeps track of what got merged into what.
     let mut cgu_contents: FxHashMap<Symbol, Vec<Symbol>> =
@@ -368,7 +368,7 @@ fn merge_codegen_units<'tcx>(
         // Move the items from `cgu_src` to `cgu_dst`. Some of them may be
         // duplicate inlined items, in which case the destination CGU is
         // unaffected. Recalculate size estimates afterwards.
-        cgu_dst.items_mut().extend(cgu_src.items_mut().drain());
+        cgu_dst.items_mut().extend(cgu_src.items_mut().drain(..));
         cgu_dst.compute_size_estimate();
 
         // Record that `cgu_dst` now contains all the stuff that was in
@@ -407,7 +407,7 @@ fn merge_codegen_units<'tcx>(
         // Move the items from `smallest` to `second_smallest`. Some of them
         // may be duplicate inlined items, in which case the destination CGU is
         // unaffected. Recalculate size estimates afterwards.
-        second_smallest.items_mut().extend(smallest.items_mut().drain());
+        second_smallest.items_mut().extend(smallest.items_mut().drain(..));
         second_smallest.compute_size_estimate();
 
         // Don't update `cgu_contents`, that's only for incremental builds.
@@ -620,6 +620,8 @@ fn characteristic_def_id_of_mono_item<'tcx>(
                 | ty::InstanceDef::ReifyShim(..)
                 | ty::InstanceDef::FnPtrShim(..)
                 | ty::InstanceDef::ClosureOnceShim { .. }
+                | ty::InstanceDef::ConstructCoroutineInClosureShim { .. }
+                | ty::InstanceDef::CoroutineKindShim { .. }
                 | ty::InstanceDef::Intrinsic(..)
                 | ty::InstanceDef::DropGlue(..)
                 | ty::InstanceDef::Virtual(..)
@@ -783,6 +785,8 @@ fn mono_item_visibility<'tcx>(
         | InstanceDef::Virtual(..)
         | InstanceDef::Intrinsic(..)
         | InstanceDef::ClosureOnceShim { .. }
+        | InstanceDef::ConstructCoroutineInClosureShim { .. }
+        | InstanceDef::CoroutineKindShim { .. }
         | InstanceDef::DropGlue(..)
         | InstanceDef::CloneShim(..)
         | InstanceDef::FnPtrAddrShim(..) => return Visibility::Hidden,

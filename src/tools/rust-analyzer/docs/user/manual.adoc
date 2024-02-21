@@ -369,7 +369,7 @@ EOF
 
 See https://sharksforarms.dev/posts/neovim-rust/ for more tips on getting started.
 
-Check out https://github.com/simrat39/rust-tools.nvim for a batteries included rust-analyzer setup for Neovim.
+Check out https://github.com/mrcjkb/rustaceanvim for a batteries included rust-analyzer setup for Neovim.
 
 ==== vim-lsp
 
@@ -512,7 +512,8 @@ https://docs.helix-editor.com/[Helix] supports LSP by default.
 However, it won't install `rust-analyzer` automatically.
 You can follow instructions for installing <<rust-analyzer-language-server-binary,`rust-analyzer` binary>>.
 
-=== Visual Studio 2022
+[#visual-studio]
+=== [[visual-studio-2022]]Visual Studio 2022
 
 There are multiple rust-analyzer extensions for Visual Studio 2022 on Windows:
 

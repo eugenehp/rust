@@ -1,6 +1,6 @@
 //! This module generates a polymorphic MIR from a hir body
 
-use std::{fmt::Write, iter, mem};
+use std::{fmt::Write, mem};
 
 use base_db::{salsa::Cycle, FileId};
 use chalk_ir::{BoundVar, ConstData, DebruijnIndex, TyKind};
@@ -14,23 +14,19 @@ use hir_def::{
     lang_item::{LangItem, LangItemTarget},
     path::Path,
     resolver::{resolver_for_expr, HasResolver, ResolveValueResult, ValueNs},
-    AdtId, DefWithBodyId, EnumVariantId, GeneralConstId, HasModule, ItemContainerId, LocalFieldId,
+    AdtId, EnumVariantId, GeneralConstId, HasModule, ItemContainerId, LocalFieldId,
     Lookup, TraitId, TupleId, TypeOrConstParamId,
 };
 use hir_expand::name::Name;
-use la_arena::ArenaMap;
-use rustc_hash::FxHashMap;
 use syntax::TextRange;
 use triomphe::Arc;
 
 use crate::{
     consteval::ConstEvalError,
-    db::HirDatabase,
-    display::HirDisplay,
+    db::InternedClosure,
     infer::{CaptureKind, CapturedItem, TypeMismatch},
     inhabitedness::is_ty_uninhabited_from,
     layout::LayoutError,
-    mapping::ToChalk,
     static_lifetime,
     traits::FnTrait,
     utils::{generics, ClosureSubst},
@@ -69,6 +65,7 @@ struct MirLowerCtx<'a> {
     drop_scopes: Vec<DropScope>,
 }
 
+// FIXME: Make this smaller, its stored in database queries
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MirLowerError {
     ConstEvalError(Box<str>, Box<ConstEvalError>),
@@ -96,7 +93,7 @@ pub enum MirLowerError {
     MutatingRvalue,
     UnresolvedLabel,
     UnresolvedUpvar(Place),
-    UnaccessableLocal,
+    InaccessibleLocal,
 
     // monomorphization errors:
     GenericArgNotProvided(TypeOrConstParamId, Substitution),
@@ -115,7 +112,7 @@ impl DropScopeToken {
         ctx.pop_drop_scope_internal(current, span)
     }
 
-    /// It is useful when we want a drop scope is syntaxically closed, but we don't want to execute any drop
+    /// It is useful when we want a drop scope is syntactically closed, but we don't want to execute any drop
     /// code. Either when the control flow is diverging (so drop code doesn't reached) or when drop is handled
     /// for us (for example a block that ended with a return statement. Return will drop everything, so the block shouldn't
     /// do anything)
@@ -123,6 +120,10 @@ impl DropScopeToken {
         std::mem::forget(self);
         ctx.pop_drop_scope_assume_dropped_internal();
     }
+}
+
+impl Drop for DropScopeToken {
+    fn drop(&mut self) {}
 }
 
 // Uncomment this to make `DropScopeToken` a drop bomb. Unfortunately we can't do this in release, since
@@ -185,7 +186,7 @@ impl MirLowerError {
             | MirLowerError::UnsizedTemporary(_)
             | MirLowerError::IncompleteExpr
             | MirLowerError::IncompletePattern
-            | MirLowerError::UnaccessableLocal
+            | MirLowerError::InaccessibleLocal
             | MirLowerError::TraitFunctionDefinition(_, _)
             | MirLowerError::UnresolvedName(_)
             | MirLowerError::RecordLiteralWithoutPath
@@ -258,7 +259,8 @@ impl<'ctx> MirLowerCtx<'ctx> {
             owner,
             closures: vec![],
         };
-        let ctx = MirLowerCtx {
+
+        MirLowerCtx {
             result: mir,
             db,
             infer,
@@ -268,8 +270,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
             labeled_loop_blocks: Default::default(),
             discr_temp: None,
             drop_scopes: vec![DropScope::default()],
-        };
-        ctx
+        }
     }
 
     fn temp(&mut self, ty: Ty, current: BasicBlockId, span: MirSpan) -> Result<LocalId> {
@@ -287,12 +288,9 @@ impl<'ctx> MirLowerCtx<'ctx> {
         current: BasicBlockId,
     ) -> Result<Option<(Operand, BasicBlockId)>> {
         if !self.has_adjustments(expr_id) {
-            match &self.body.exprs[expr_id] {
-                Expr::Literal(l) => {
-                    let ty = self.expr_ty_without_adjust(expr_id);
-                    return Ok(Some((self.lower_literal_to_operand(ty, l)?, current)));
-                }
-                _ => (),
+            if let Expr::Literal(l) = &self.body.exprs[expr_id] {
+                let ty = self.expr_ty_without_adjust(expr_id);
+                return Ok(Some((self.lower_literal_to_operand(ty, l)?, current)));
             }
         }
         let Some((p, current)) = self.lower_expr_as_place(current, expr_id, true)? else {
@@ -344,8 +342,8 @@ impl<'ctx> MirLowerCtx<'ctx> {
                         current,
                         place,
                         Rvalue::Cast(
-                            CastKind::Pointer(cast.clone()),
-                            Operand::Copy(p).into(),
+                            CastKind::Pointer(*cast),
+                            Operand::Copy(p),
                             last.target.clone(),
                         ),
                         expr_id.into(),
@@ -456,9 +454,8 @@ impl<'ctx> MirLowerCtx<'ctx> {
                         Ok(Some(current))
                     }
                     ValueNs::EnumVariantId(variant_id) => {
-                        let variant_data =
-                            &self.db.enum_data(variant_id.parent).variants[variant_id.local_id];
-                        if variant_data.variant_data.kind() == StructKind::Unit {
+                        let variant_data = &self.db.enum_variant_data(variant_id).variant_data;
+                        if variant_data.kind() == StructKind::Unit {
                             let ty = self.infer.type_of_expr[expr_id].clone();
                             current = self.lower_enum_variant(
                                 variant_id,
@@ -511,8 +508,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     return Ok(None);
                 };
                 let start_of_then = self.new_basic_block();
-                let end_of_then =
-                    self.lower_expr_to_place(*then_branch, place.clone(), start_of_then)?;
+                let end_of_then = self.lower_expr_to_place(*then_branch, place, start_of_then)?;
                 let start_of_else = self.new_basic_block();
                 let end_of_else = if let Some(else_branch) = else_branch {
                     self.lower_expr_to_place(*else_branch, place, start_of_else)?
@@ -539,7 +535,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     self.pattern_match(current, None, cond_place, *pat)?;
                 self.write_bytes_to_place(
                     then_target,
-                    place.clone(),
+                    place,
                     Box::new([1]),
                     TyBuilder::bool(),
                     MirSpan::Unknown,
@@ -560,25 +556,19 @@ impl<'ctx> MirLowerCtx<'ctx> {
             }
             Expr::Block { id: _, statements, tail, label } => {
                 if let Some(label) = label {
-                    self.lower_loop(
-                        current,
-                        place.clone(),
-                        Some(*label),
-                        expr_id.into(),
-                        |this, begin| {
-                            if let Some(current) = this.lower_block_to_place(
-                                statements,
-                                begin,
-                                *tail,
-                                place,
-                                expr_id.into(),
-                            )? {
-                                let end = this.current_loop_end()?;
-                                this.set_goto(current, end, expr_id.into());
-                            }
-                            Ok(())
-                        },
-                    )
+                    self.lower_loop(current, place, Some(*label), expr_id.into(), |this, begin| {
+                        if let Some(current) = this.lower_block_to_place(
+                            statements,
+                            begin,
+                            *tail,
+                            place,
+                            expr_id.into(),
+                        )? {
+                            let end = this.current_loop_end()?;
+                            this.set_goto(current, end, expr_id.into());
+                        }
+                        Ok(())
+                    })
                 } else {
                     self.lower_block_to_place(statements, current, *tail, place, expr_id.into())
                 }
@@ -646,9 +636,9 @@ impl<'ctx> MirLowerCtx<'ctx> {
                         );
                     }
                     TyKind::Error => {
-                        return Err(MirLowerError::MissingFunctionDefinition(self.owner, expr_id))
+                        Err(MirLowerError::MissingFunctionDefinition(self.owner, expr_id))
                     }
-                    _ => return Err(MirLowerError::TypeError("function call on bad type")),
+                    _ => Err(MirLowerError::TypeError("function call on bad type")),
                 }
             }
             Expr::MethodCall { receiver, args, method_name, .. } => {
@@ -678,7 +668,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 let mut end = None;
                 for MatchArm { pat, guard, expr } in arms.iter() {
                     let (then, mut otherwise) =
-                        self.pattern_match(current, None, cond_place.clone(), *pat)?;
+                        self.pattern_match(current, None, cond_place, *pat)?;
                     let then = if let &Some(guard) = guard {
                         let next = self.new_basic_block();
                         let o = otherwise.get_or_insert_with(|| self.new_basic_block());
@@ -696,7 +686,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     } else {
                         then
                     };
-                    if let Some(block) = self.lower_expr_to_place(*expr, place.clone(), then)? {
+                    if let Some(block) = self.lower_expr_to_place(*expr, place, then)? {
                         let r = end.get_or_insert_with(|| self.new_basic_block());
                         self.set_goto(block, *r, expr_id.into());
                     }
@@ -742,9 +732,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                             .as_ref()
                             .ok_or(MirLowerError::BreakWithoutLoop)?,
                     };
-                    let Some(c) =
-                        self.lower_expr_to_place(expr, loop_data.place.clone(), current)?
-                    else {
+                    let Some(c) = self.lower_expr_to_place(expr, loop_data.place, current)? else {
                         return Ok(None);
                     };
                     current = c;
@@ -783,6 +771,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 self.set_terminator(current, TerminatorKind::Return, expr_id.into());
                 Ok(None)
             }
+            Expr::Become { .. } => not_supported!("tail-calls"),
             Expr::Yield { .. } => not_supported!("yield"),
             Expr::RecordLit { fields, path, spread, ellipsis: _, is_assignee_expr: _ } => {
                 let spread_place = match spread {
@@ -906,7 +895,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 let ty = self.expr_ty_after_adjustments(*expr);
                 self.push_assignment(
                     current,
-                    place.clone(),
+                    place,
                     Rvalue::ShallowInitBoxWithAlloc(ty),
                     expr_id.into(),
                 );
@@ -951,16 +940,17 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 Ok(Some(current))
             }
             Expr::BinaryOp { lhs, rhs, op } => {
-                let op = op.ok_or(MirLowerError::IncompleteExpr)?;
+                let op: BinaryOp = op.ok_or(MirLowerError::IncompleteExpr)?;
                 let is_builtin = 'b: {
                     // Without adjust here is a hack. We assume that we know every possible adjustment
                     // for binary operator, and use without adjust to simplify our conditions.
                     let lhs_ty = self.expr_ty_without_adjust(*lhs);
                     let rhs_ty = self.expr_ty_without_adjust(*rhs);
-                    if matches!(op, BinaryOp::CmpOp(syntax::ast::CmpOp::Eq { .. })) {
-                        if lhs_ty.as_raw_ptr().is_some() && rhs_ty.as_raw_ptr().is_some() {
-                            break 'b true;
-                        }
+                    if matches!(op, BinaryOp::CmpOp(syntax::ast::CmpOp::Eq { .. }))
+                        && lhs_ty.as_raw_ptr().is_some()
+                        && rhs_ty.as_raw_ptr().is_some()
+                    {
+                        break 'b true;
                     }
                     let builtin_inequal_impls = matches!(
                         op,
@@ -1006,11 +996,8 @@ impl<'ctx> MirLowerCtx<'ctx> {
                         else {
                             return Ok(None);
                         };
-                        let r_value = Rvalue::CheckedBinaryOp(
-                            op.into(),
-                            Operand::Copy(lhs_place.clone()),
-                            rhs_op,
-                        );
+                        let r_value =
+                            Rvalue::CheckedBinaryOp(op.into(), Operand::Copy(lhs_place), rhs_op);
                         self.push_assignment(current, lhs_place, r_value, expr_id.into());
                         return Ok(Some(current));
                     } else {
@@ -1029,7 +1016,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     let start_of_then = self.new_basic_block();
                     self.push_assignment(
                         start_of_then,
-                        place.clone(),
+                        place,
                         lhs_op.clone().into(),
                         expr_id.into(),
                     );
@@ -1168,12 +1155,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                             let tmp_ty =
                                 capture.ty.clone().substitute(Interner, &placeholder_subst);
                             let tmp: Place = self.temp(tmp_ty, current, capture.span)?.into();
-                            self.push_assignment(
-                                current,
-                                tmp.clone(),
-                                Rvalue::Ref(bk.clone(), p),
-                                capture.span,
-                            );
+                            self.push_assignment(current, tmp, Rvalue::Ref(*bk, p), capture.span);
                             operands.push(Operand::Move(tmp));
                         }
                         CaptureKind::ByValue => operands.push(Operand::Move(p)),
@@ -1261,7 +1243,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 self.push_assignment(current, place, op.into(), expr_id.into());
                 Ok(Some(current))
             }
-            Expr::Underscore => not_supported!("underscore"),
+            Expr::Underscore => Ok(Some(current)),
         }
     }
 
@@ -1322,7 +1304,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
         ) {
             let temp = self.temp(self.expr_ty_after_adjustments(rhs), current, rhs.into())?;
             let temp = Place::from(temp);
-            self.push_assignment(current, temp.clone(), rhs_op.into(), span);
+            self.push_assignment(current, temp, rhs_op.into(), span);
             return self.lower_destructing_assignment(current, lhs, temp, span);
         }
         let Some((lhs_place, current)) = self.lower_expr_as_place(current, lhs, false)? else {
@@ -1333,11 +1315,10 @@ impl<'ctx> MirLowerCtx<'ctx> {
     }
 
     fn placeholder_subst(&mut self) -> Substitution {
-        let placeholder_subst = match self.owner.as_generic_def_id() {
+        match self.owner.as_generic_def_id() {
             Some(it) => TyBuilder::placeholder_subst(self.db, it),
             None => Substitution::empty(Interner),
-        };
-        placeholder_subst
+        }
     }
 
     fn push_field_projection(&mut self, place: &mut Place, expr_id: ExprId) -> Result<()> {
@@ -1470,7 +1451,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
         } else {
             let name = const_id.name(self.db.upcast());
             self.db
-                .const_eval(const_id.into(), subst, None)
+                .const_eval(const_id, subst, None)
                 .map_err(|e| MirLowerError::ConstEvalError(name.into(), Box::new(e)))?
         };
         Ok(Operand::Constant(c))
@@ -1612,13 +1593,13 @@ impl<'ctx> MirLowerCtx<'ctx> {
 
     fn discr_temp_place(&mut self, current: BasicBlockId) -> Place {
         match &self.discr_temp {
-            Some(it) => it.clone(),
+            Some(it) => *it,
             None => {
                 let tmp: Place = self
                     .temp(TyBuilder::discr_ty(), current, MirSpan::Unknown)
                     .expect("discr_ty is never unsized")
                     .into();
-                self.discr_temp = Some(tmp.clone());
+                self.discr_temp = Some(tmp);
                 tmp
             }
         }
@@ -1650,7 +1631,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
         self.set_goto(prev_block, begin, span);
         f(self, begin)?;
         let my = mem::replace(&mut self.current_loop_blocks, prev).ok_or(
-            MirLowerError::ImplementationError("current_loop_blocks is corrupt".to_string()),
+            MirLowerError::ImplementationError("current_loop_blocks is corrupt".to_owned()),
         )?;
         if let Some(prev) = prev_label {
             self.labeled_loop_blocks.insert(label.unwrap(), prev);
@@ -1685,7 +1666,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
             .current_loop_blocks
             .as_mut()
             .ok_or(MirLowerError::ImplementationError(
-                "Current loop access out of loop".to_string(),
+                "Current loop access out of loop".to_owned(),
             ))?
             .end
         {
@@ -1695,7 +1676,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 self.current_loop_blocks
                     .as_mut()
                     .ok_or(MirLowerError::ImplementationError(
-                        "Current loop access out of loop".to_string(),
+                        "Current loop access out of loop".to_owned(),
                     ))?
                     .end = Some(s);
                 s
@@ -1796,6 +1777,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     self.push_fake_read(c, p, expr.into());
                     current = scope2.pop_and_drop(self, c, expr.into());
                 }
+                hir_def::hir::Statement::Item => (),
             }
         }
         if let Some(tail) = tail {
@@ -1863,8 +1845,8 @@ impl<'ctx> MirLowerCtx<'ctx> {
             None => {
                 // FIXME: It should never happens, but currently it will happen in `const_dependent_on_local` test, which
                 // is a hir lowering problem IMO.
-                // never!("Using unaccessable local for binding is always a bug");
-                Err(MirLowerError::UnaccessableLocal)
+                // never!("Using inaccessible local for binding is always a bug");
+                Err(MirLowerError::InaccessibleLocal)
             }
         }
     }
@@ -1874,11 +1856,13 @@ impl<'ctx> MirLowerCtx<'ctx> {
         match r {
             Ok(r) => Ok(r),
             Err(e) => {
-                let data = self.db.enum_data(variant.parent);
+                let db = self.db.upcast();
+                let loc = variant.lookup(db);
+                let enum_loc = loc.parent.lookup(db);
                 let name = format!(
                     "{}::{}",
-                    data.name.display(self.db.upcast()),
-                    data.variants[variant.local_id].name.display(self.db.upcast())
+                    enum_loc.id.item_tree(db)[enum_loc.id.value].name.display(db.upcast()),
+                    loc.id.item_tree(db)[loc.id.value].name.display(db.upcast()),
                 );
                 Err(MirLowerError::ConstEvalError(name.into(), Box::new(e)))
             }
@@ -1991,7 +1975,7 @@ pub fn mir_body_for_closure_query(
     db: &dyn HirDatabase,
     closure: ClosureId,
 ) -> Result<Arc<MirBody>> {
-    let (owner, expr) = db.lookup_intern_closure(closure.into());
+    let InternedClosure(owner, expr) = db.lookup_intern_closure(closure.into());
     let body = db.body(owner);
     let infer = db.infer(owner);
     let Expr::Closure { args, body: root, .. } = &body[expr] else {
@@ -2039,19 +2023,16 @@ pub fn mir_body_for_closure_query(
     ctx.result.walk_places(|p, store| {
         if let Some(it) = upvar_map.get(&p.local) {
             let r = it.iter().find(|it| {
-                if p.projection.lookup(&store).len() < it.0.place.projections.len() {
+                if p.projection.lookup(store).len() < it.0.place.projections.len() {
                     return false;
                 }
-                for (it, y) in p.projection.lookup(&store).iter().zip(it.0.place.projections.iter())
+                for (it, y) in p.projection.lookup(store).iter().zip(it.0.place.projections.iter())
                 {
                     match (it, y) {
                         (ProjectionElem::Deref, ProjectionElem::Deref) => (),
                         (ProjectionElem::Field(it), ProjectionElem::Field(y)) if it == y => (),
                         (ProjectionElem::ClosureField(it), ProjectionElem::ClosureField(y))
-                            if it == y =>
-                        {
-                            ()
-                        }
+                            if it == y => {}
                         _ => return false,
                     }
                 }
@@ -2067,15 +2048,11 @@ pub fn mir_body_for_closure_query(
                         next_projs.push(ProjectionElem::Deref);
                     }
                     next_projs.extend(
-                        prev_projs
-                            .lookup(&store)
-                            .iter()
-                            .skip(it.0.place.projections.len())
-                            .cloned(),
+                        prev_projs.lookup(store).iter().skip(it.0.place.projections.len()).cloned(),
                     );
                     p.projection = store.intern(next_projs.into());
                 }
-                None => err = Some(p.clone()),
+                None => err = Some(*p),
             }
         }
     });
@@ -2093,7 +2070,7 @@ pub fn mir_body_for_closure_query(
 }
 
 pub fn mir_body_query(db: &dyn HirDatabase, def: DefWithBodyId) -> Result<Arc<MirBody>> {
-    let _p = profile::span("mir_body_query").detail(|| match def {
+    let detail = match def {
         DefWithBodyId::FunctionId(it) => db.function_data(it).name.display(db.upcast()).to_string(),
         DefWithBodyId::StaticId(it) => db.static_data(it).name.display(db.upcast()).to_string(),
         DefWithBodyId::ConstId(it) => db
@@ -2104,10 +2081,11 @@ pub fn mir_body_query(db: &dyn HirDatabase, def: DefWithBodyId) -> Result<Arc<Mi
             .display(db.upcast())
             .to_string(),
         DefWithBodyId::VariantId(it) => {
-            db.enum_data(it.parent).variants[it.local_id].name.display(db.upcast()).to_string()
+            db.enum_variant_data(it).name.display(db.upcast()).to_string()
         }
         DefWithBodyId::InTypeConstId(it) => format!("in type const {it:?}"),
-    });
+    };
+    let _p = tracing::span!(tracing::Level::INFO, "mir_body_query", ?detail).entered();
     let body = db.body(def);
     let infer = db.infer(def);
     let mut result = lower_to_mir(db, def, &body, &infer, body.body_expr)?;

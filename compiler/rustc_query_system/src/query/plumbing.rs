@@ -429,16 +429,16 @@ where
             let formatter = query.format_value();
             if old_hash != new_hash {
                 // We have an inconsistency. This can happen if one of the two
-                // results is tainted by errors. In this case, delay a bug to
-                // ensure compilation is doomed.
-                qcx.dep_context().sess().dcx().delayed_bug(format!(
+                // results is tainted by errors.
+                assert!(
+                    qcx.dep_context().sess().dcx().has_errors().is_some(),
                     "Computed query value for {:?}({:?}) is inconsistent with fed value,\n\
                         computed={:#?}\nfed={:#?}",
                     query.dep_kind(),
                     key,
                     formatter(&result),
                     formatter(&cached_result),
-                ));
+                );
             }
         }
     }
@@ -538,10 +538,9 @@ where
 
     prof_timer.finish_with_query_invocation_id(dep_node_index.into());
 
-    let diagnostics = diagnostics.into_inner();
-    let side_effects = QuerySideEffects { diagnostics };
+    let side_effects = QuerySideEffects { diagnostics: diagnostics.into_inner() };
 
-    if std::intrinsics::unlikely(!side_effects.is_empty()) {
+    if std::intrinsics::unlikely(side_effects.maybe_any()) {
         if query.anon() {
             qcx.store_side_effects_for_anon_node(dep_node_index, side_effects);
         } else {

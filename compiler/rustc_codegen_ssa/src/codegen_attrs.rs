@@ -1,6 +1,6 @@
 use rustc_ast::{ast, attr, MetaItemKind, NestedMetaItem};
 use rustc_attr::{list_contains_name, InlineAttr, InstructionSetAttr, OptimizeAttr};
-use rustc_errors::struct_span_code_err;
+use rustc_errors::{codes::*, struct_span_code_err};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId, LOCAL_CRATE};
@@ -103,9 +103,6 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
         match name {
             sym::cold => codegen_fn_attrs.flags |= CodegenFnAttrFlags::COLD,
             sym::rustc_allocator => codegen_fn_attrs.flags |= CodegenFnAttrFlags::ALLOCATOR,
-            sym::ffi_returns_twice => {
-                codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_RETURNS_TWICE
-            }
             sym::ffi_pure => codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_PURE,
             sym::ffi_const => codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_CONST,
             sym::rustc_nounwind => codegen_fn_attrs.flags |= CodegenFnAttrFlags::NEVER_UNWIND,
@@ -232,7 +229,7 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
             }
             sym::thread_local => codegen_fn_attrs.flags |= CodegenFnAttrFlags::THREAD_LOCAL,
             sym::track_caller => {
-                let is_closure = tcx.is_closure_or_coroutine(did.to_def_id());
+                let is_closure = tcx.is_closure_like(did.to_def_id());
 
                 if !is_closure
                     && let Some(fn_sig) = fn_sig()
@@ -277,7 +274,7 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
                 }
             }
             sym::target_feature => {
-                if !tcx.is_closure_or_coroutine(did.to_def_id())
+                if !tcx.is_closure_like(did.to_def_id())
                     && let Some(fn_sig) = fn_sig()
                     && fn_sig.skip_binder().unsafety() == hir::Unsafety::Normal
                 {
@@ -532,7 +529,7 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
     // would result in this closure being compiled without the inherited target features, but this
     // is probably a poor usage of `#[inline(always)]` and easily avoided by not using the attribute.
     if tcx.features().target_feature_11
-        && tcx.is_closure_or_coroutine(did.to_def_id())
+        && tcx.is_closure_like(did.to_def_id())
         && codegen_fn_attrs.inline != InlineAttr::Always
     {
         let owner_id = tcx.parent(did.to_def_id());
@@ -563,7 +560,7 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
         if codegen_fn_attrs.inline == InlineAttr::Always {
             if let (Some(no_sanitize_span), Some(inline_span)) = (no_sanitize_span, inline_span) {
                 let hir_id = tcx.local_def_id_to_hir_id(did);
-                tcx.struct_span_lint_hir(
+                tcx.node_span_lint(
                     lint::builtin::INLINE_NO_SANITIZE,
                     hir_id,
                     no_sanitize_span,
@@ -658,7 +655,7 @@ fn check_link_ordinal(tcx: TyCtxt<'_>, attr: &ast::Attribute) -> Option<u16> {
         // if the resulting EXE runs, as I haven't yet built the necessary DLL -- see earlier comment
         // about LINK.EXE failing.)
         if *ordinal <= u16::MAX as u128 {
-            Some(*ordinal as u16)
+            Some(ordinal.get() as u16)
         } else {
             let msg = format!("ordinal value in `link_ordinal` is too large: `{}`", &ordinal);
             tcx.dcx()

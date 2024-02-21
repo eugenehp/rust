@@ -206,7 +206,7 @@ impl Definition {
             // docs are missing, for assoc items of trait impls try to fall back to the docs of the
             // original item of the trait
             let assoc = self.as_assoc_item(db)?;
-            let trait_ = assoc.containing_trait_impl(db)?;
+            let trait_ = assoc.implemented_trait(db)?;
             let name = Some(assoc.name(db)?);
             let item = trait_.items(db).into_iter().find(|it| it.name(db) == name)?;
             item.docs(db)
@@ -230,23 +230,15 @@ impl Definition {
             Definition::BuiltinType(it) => it.name().display(db).to_string(),
             Definition::Local(it) => {
                 let ty = it.ty(db);
-                let ty = ty.display_truncated(db, None);
+                let ty_display = ty.display_truncated(db, None);
                 let is_mut = if it.is_mut(db) { "mut " } else { "" };
-                let desc = match it.primary_source(db).into_ident_pat() {
-                    Some(ident) => {
-                        let name = it.name(db);
-                        let let_kw = if ident.syntax().parent().map_or(false, |p| {
-                            p.kind() == SyntaxKind::LET_STMT || p.kind() == SyntaxKind::LET_EXPR
-                        }) {
-                            "let "
-                        } else {
-                            ""
-                        };
-                        format!("{let_kw}{is_mut}{}: {ty}", name.display(db))
-                    }
-                    None => format!("{is_mut}self: {ty}"),
-                };
-                desc
+                if it.is_self(db) {
+                    format!("{is_mut}self: {ty_display}")
+                } else {
+                    let name = it.name(db);
+                    let let_kw = if it.is_param(db) { "" } else { "let " };
+                    format!("{let_kw}{is_mut}{}: {ty_display}", name.display(db))
+                }
             }
             Definition::SelfType(impl_def) => {
                 impl_def.self_ty(db).as_adt().and_then(|adt| Definition::Adt(adt).label(db))?
@@ -412,7 +404,7 @@ impl NameClass {
     }
 
     pub fn classify(sema: &Semantics<'_, RootDatabase>, name: &ast::Name) -> Option<NameClass> {
-        let _p = profile::span("classify_name");
+        let _p = tracing::span!(tracing::Level::INFO, "classify_name").entered();
 
         let parent = name.syntax().parent()?;
 
@@ -504,7 +496,7 @@ impl NameClass {
         sema: &Semantics<'_, RootDatabase>,
         lifetime: &ast::Lifetime,
     ) -> Option<NameClass> {
-        let _p = profile::span("classify_lifetime").detail(|| lifetime.to_string());
+        let _p = tracing::span!(tracing::Level::INFO, "classify_lifetime", ?lifetime).entered();
         let parent = lifetime.syntax().parent()?;
 
         if let Some(it) = ast::LifetimeParam::cast(parent.clone()) {
@@ -595,7 +587,7 @@ impl NameRefClass {
         sema: &Semantics<'_, RootDatabase>,
         name_ref: &ast::NameRef,
     ) -> Option<NameRefClass> {
-        let _p = profile::span("classify_name_ref").detail(|| name_ref.to_string());
+        let _p = tracing::span!(tracing::Level::INFO, "classify_name_ref", ?name_ref).entered();
 
         let parent = name_ref.syntax().parent()?;
 
@@ -694,7 +686,7 @@ impl NameRefClass {
         sema: &Semantics<'_, RootDatabase>,
         lifetime: &ast::Lifetime,
     ) -> Option<NameRefClass> {
-        let _p = profile::span("classify_lifetime_ref").detail(|| lifetime.to_string());
+        let _p = tracing::span!(tracing::Level::INFO, "classify_lifetime_ref", ?lifetime).entered();
         let parent = lifetime.syntax().parent()?;
         match parent.kind() {
             SyntaxKind::BREAK_EXPR | SyntaxKind::CONTINUE_EXPR => {

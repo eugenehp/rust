@@ -371,7 +371,15 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
                 if p.at(op) {
                     m = p.start();
                     p.bump(op);
-                    if p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{'])) {
+
+                    // test closure_range_method_call
+                    // fn foo() {
+                    //     || .. .method();
+                    //     || .. .field;
+                    // }
+                    let has_access_after = p.at(T![.]) && p.nth_at(1, SyntaxKind::IDENT);
+                    let struct_forbidden = r.forbid_structs && p.at(T!['{']);
+                    if p.at_ts(EXPR_FIRST) && !has_access_after && !struct_forbidden {
                         expr_bp(p, None, r, 2);
                     }
                     let cm = m.complete(p, RANGE_EXPR);
@@ -522,6 +530,15 @@ fn method_call_expr<const FLOAT_RECOVERY: bool>(
     generic_args::opt_generic_arg_list(p, true);
     if p.at(T!['(']) {
         arg_list(p);
+    } else {
+        // emit an error when argument list is missing
+
+        // test_err method_call_missing_argument_list
+        // fn func() {
+        //     foo.bar::<>
+        //     foo.bar::<i32>;
+        // }
+        p.error("expected argument list");
     }
     m.complete(p, METHOD_CALL_EXPR)
 }
@@ -594,6 +611,7 @@ fn cast_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
 //     foo(bar::);
 //     foo(bar:);
 //     foo(bar+);
+//     foo(a, , b);
 // }
 fn arg_list(p: &mut Parser<'_>) {
     assert!(p.at(T!['(']));
@@ -607,8 +625,9 @@ fn arg_list(p: &mut Parser<'_>) {
         T!['('],
         T![')'],
         T![,],
+        || "expected expression".into(),
         EXPR_FIRST.union(ATTRIBUTE_FIRST),
-        |p: &mut Parser<'_>| expr(p).is_some(),
+        |p| expr(p).is_some(),
     );
     m.complete(p, ARG_LIST);
 }
@@ -659,27 +678,38 @@ pub(crate) fn record_expr_field_list(p: &mut Parser<'_>) {
         attributes::outer_attrs(p);
 
         match p.current() {
-            IDENT | INT_NUMBER => {
+            IDENT | INT_NUMBER if p.nth_at(1, T![::]) => {
                 // test_err record_literal_missing_ellipsis_recovery
                 // fn main() {
                 //     S { S::default() }
                 // }
-                if p.nth_at(1, T![::]) {
-                    m.abandon(p);
-                    p.expect(T![..]);
-                    expr(p);
-                } else {
+                m.abandon(p);
+                p.expect(T![..]);
+                expr(p);
+            }
+            IDENT | INT_NUMBER => {
+                if p.nth_at(1, T![..]) {
                     // test_err record_literal_before_ellipsis_recovery
                     // fn main() {
                     //     S { field ..S::default() }
                     // }
-                    if p.nth_at(1, T![:]) || p.nth_at(1, T![..]) {
+                    name_ref_or_index(p);
+                    p.error("expected `:`");
+                } else {
+                    // test_err record_literal_field_eq_recovery
+                    // fn main() {
+                    //     S { field = foo }
+                    // }
+                    if p.nth_at(1, T![:]) {
                         name_ref_or_index(p);
-                        p.expect(T![:]);
+                        p.bump(T![:]);
+                    } else if p.nth_at(1, T![=]) {
+                        name_ref_or_index(p);
+                        p.err_and_bump("expected `:`");
                     }
                     expr(p);
-                    m.complete(p, RECORD_EXPR_FIELD);
                 }
+                m.complete(p, RECORD_EXPR_FIELD);
             }
             T![.] if p.at(T![..]) => {
                 m.abandon(p);

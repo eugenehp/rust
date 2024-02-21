@@ -23,7 +23,7 @@ use crate::parser;
 use crate::parser::attr::InnerAttrPolicy;
 use rustc_ast as ast;
 use rustc_ast::ptr::P;
-use rustc_ast::token::{self, Delimiter, Lit, LitKind, TokenKind};
+use rustc_ast::token::{self, Delimiter, Lit, LitKind, Token, TokenKind};
 use rustc_ast::tokenstream::AttrTokenTree;
 use rustc_ast::util::parser::AssocOp;
 use rustc_ast::{
@@ -34,8 +34,8 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{
-    pluralize, AddToDiagnostic, Applicability, DiagCtxt, Diagnostic, DiagnosticBuilder,
-    ErrorGuaranteed, FatalError, PErr, PResult,
+    pluralize, AddToDiagnostic, Applicability, DiagCtxt, DiagnosticBuilder, ErrorGuaranteed,
+    FatalError, PErr, PResult,
 };
 use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_span::source_map::Spanned;
@@ -46,14 +46,14 @@ use std::ops::{Deref, DerefMut};
 use thin_vec::{thin_vec, ThinVec};
 
 /// Creates a placeholder argument.
-pub(super) fn dummy_arg(ident: Ident) -> Param {
+pub(super) fn dummy_arg(ident: Ident, guar: ErrorGuaranteed) -> Param {
     let pat = P(Pat {
         id: ast::DUMMY_NODE_ID,
         kind: PatKind::Ident(BindingAnnotation::NONE, ident, None),
         span: ident.span,
         tokens: None,
     });
-    let ty = Ty { kind: TyKind::Err, span: ident.span, id: ast::DUMMY_NODE_ID, tokens: None };
+    let ty = Ty { kind: TyKind::Err(guar), span: ident.span, id: ast::DUMMY_NODE_ID, tokens: None };
     Param {
         attrs: AttrVec::default(),
         id: ast::DUMMY_NODE_ID,
@@ -208,11 +208,11 @@ struct MultiSugg {
 }
 
 impl MultiSugg {
-    fn emit(self, err: &mut Diagnostic) {
+    fn emit(self, err: &mut DiagnosticBuilder<'_>) {
         err.multipart_suggestion(self.msg, self.patches, self.applicability);
     }
 
-    fn emit_verbose(self, err: &mut Diagnostic) {
+    fn emit_verbose(self, err: &mut DiagnosticBuilder<'_>) {
         err.multipart_suggestion_verbose(self.msg, self.patches, self.applicability);
     }
 }
@@ -448,12 +448,10 @@ impl<'a> Parser<'a> {
             })
         }
 
-        let mut expected = edible
+        self.expected_tokens.extend(edible.iter().chain(inedible).cloned().map(TokenType::Token));
+        let mut expected = self
+            .expected_tokens
             .iter()
-            .chain(inedible)
-            .cloned()
-            .map(TokenType::Token)
-            .chain(self.expected_tokens.iter().cloned())
             .filter(|token| {
                 // Filter out suggestions that suggest the same token which was found and deemed incorrect.
                 fn is_ident_eq_keyword(found: &TokenKind, expected: &TokenType) -> bool {
@@ -465,7 +463,7 @@ impl<'a> Parser<'a> {
                     false
                 }
 
-                if *token != parser::TokenType::Token(self.token.kind.clone()) {
+                if **token != parser::TokenType::Token(self.token.kind.clone()) {
                     let eq = is_ident_eq_keyword(&self.token.kind, &token);
                     // If the suggestion is a keyword and the found token is an ident,
                     // the content of which are equal to the suggestion's content,
@@ -484,6 +482,7 @@ impl<'a> Parser<'a> {
                 }
                 false
             })
+            .cloned()
             .collect::<Vec<_>>();
         expected.sort_by_cached_key(|x| x.to_string());
         expected.dedup();
@@ -792,13 +791,28 @@ impl<'a> Parser<'a> {
                 && let [segment] = &attr_kind.item.path.segments[..]
                 && segment.ident.name == sym::cfg
                 && let Some(args_span) = attr_kind.item.args.span()
-                && let Ok(next_attr) = snapshot.parse_attribute(InnerAttrPolicy::Forbidden(None))
+                && let next_attr = match snapshot.parse_attribute(InnerAttrPolicy::Forbidden(None))
+                {
+                    Ok(next_attr) => next_attr,
+                    Err(inner_err) => {
+                        err.cancel();
+                        inner_err.cancel();
+                        return;
+                    }
+                }
                 && let ast::AttrKind::Normal(next_attr_kind) = next_attr.kind
                 && let Some(next_attr_args_span) = next_attr_kind.item.args.span()
                 && let [next_segment] = &next_attr_kind.item.path.segments[..]
                 && segment.ident.name == sym::cfg
-                && let Ok(next_expr) = snapshot.parse_expr()
             {
+                let next_expr = match snapshot.parse_expr() {
+                    Ok(next_expr) => next_expr,
+                    Err(inner_err) => {
+                        err.cancel();
+                        inner_err.cancel();
+                        return;
+                    }
+                };
                 // We have for sure
                 // #[cfg(..)]
                 // expr
@@ -832,7 +846,7 @@ impl<'a> Parser<'a> {
         err.emit();
     }
 
-    fn check_too_many_raw_str_terminators(&mut self, err: &mut Diagnostic) -> bool {
+    fn check_too_many_raw_str_terminators(&mut self, err: &mut DiagnosticBuilder<'_>) -> bool {
         let sm = self.sess.source_map();
         match (&self.prev_token.kind, &self.token.kind) {
             (
@@ -886,7 +900,7 @@ impl<'a> Parser<'a> {
             // fn foo() -> Foo {
             //     field: value,
             // }
-            info!(?maybe_struct_name, ?self.token);
+            debug!(?maybe_struct_name, ?self.token);
             let mut snapshot = self.create_snapshot_for_diagnostic();
             let path = Path {
                 segments: ThinVec::new(),
@@ -1526,14 +1540,14 @@ impl<'a> Parser<'a> {
     pub(super) fn maybe_recover_from_question_mark(&mut self, ty: P<Ty>) -> P<Ty> {
         if self.token == token::Question {
             self.bump();
-            self.dcx().emit_err(QuestionMarkInType {
+            let guar = self.dcx().emit_err(QuestionMarkInType {
                 span: self.prev_token.span,
                 sugg: QuestionMarkInTypeSugg {
                     left: ty.span.shrink_to_lo(),
                     right: self.prev_token.span,
                 },
             });
-            self.mk_ty(ty.span.to(self.prev_token.span), TyKind::Err)
+            self.mk_ty(ty.span.to(self.prev_token.span), TyKind::Err(guar))
         } else {
             ty
         }
@@ -2165,7 +2179,7 @@ impl<'a> Parser<'a> {
 
     pub(super) fn parameter_without_type(
         &mut self,
-        err: &mut Diagnostic,
+        err: &mut DiagnosticBuilder<'_>,
         pat: P<ast::Pat>,
         require_name: bool,
         first_param: bool,
@@ -2290,8 +2304,8 @@ impl<'a> Parser<'a> {
 
     pub(super) fn recover_bad_self_param(&mut self, mut param: Param) -> PResult<'a, Param> {
         let span = param.pat.span;
-        param.ty.kind = TyKind::Err;
-        self.dcx().emit_err(SelfParamNotFirst { span });
+        let guar = self.dcx().emit_err(SelfParamNotFirst { span });
+        param.ty.kind = TyKind::Err(guar);
         Ok(param)
     }
 
@@ -2336,7 +2350,7 @@ impl<'a> Parser<'a> {
         let mut err = self.dcx().struct_span_err(span, msg);
         let sp = self.sess.source_map().start_point(self.token.span);
         if let Some(sp) = self.sess.ambiguous_block_expr_parse.borrow().get(&sp) {
-            err.subdiagnostic(ExprParenthesesNeeded::surrounding(*sp));
+            err.subdiagnostic(self.dcx(), ExprParenthesesNeeded::surrounding(*sp));
         }
         err.span_label(span, "expected expression");
 
@@ -2423,7 +2437,7 @@ impl<'a> Parser<'a> {
     pub(super) fn deduplicate_recovered_params_names(&self, fn_inputs: &mut ThinVec<Param>) {
         let mut seen_inputs = FxHashSet::default();
         for input in fn_inputs.iter_mut() {
-            let opt_ident = if let (PatKind::Ident(_, ident, _), TyKind::Err) =
+            let opt_ident = if let (PatKind::Ident(_, ident, _), TyKind::Err(_)) =
                 (&input.pat.kind, &input.ty.kind)
             {
                 Some(*ident)
@@ -2630,8 +2644,10 @@ impl<'a> Parser<'a> {
                         "::",
                         Applicability::MaybeIncorrect,
                     );
-                    err.emit();
-                    return Ok(GenericArg::Type(self.mk_ty(start.to(expr.span), TyKind::Err)));
+                    let guar = err.emit();
+                    return Ok(GenericArg::Type(
+                        self.mk_ty(start.to(expr.span), TyKind::Err(guar)),
+                    ));
                 } else if token::Comma == self.token.kind || self.token.kind.should_end_const_arg()
                 {
                     // Avoid the following output by checking that we consumed a full const arg:
@@ -2925,6 +2941,22 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Check for exclusive ranges written as `..<`
+    pub(crate) fn maybe_err_dotdotlt_syntax(&self, maybe_lt: Token, mut err: PErr<'a>) -> PErr<'a> {
+        if maybe_lt == token::Lt
+            && (self.expected_tokens.contains(&TokenType::Token(token::Gt))
+                || matches!(self.token.kind, token::Literal(..)))
+        {
+            err.span_suggestion(
+                maybe_lt.span,
+                "remove the `<` to write an exclusive range",
+                "",
+                Applicability::MachineApplicable,
+            );
+        }
+        err
     }
 
     pub fn is_diff_marker(&mut self, long_kind: &TokenKind, short_kind: &TokenKind) -> bool {

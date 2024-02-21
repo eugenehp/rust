@@ -1,4 +1,4 @@
-// compile-flags: -Znext-solver
+//@ compile-flags: -Znext-solver
 
 trait Foo {
     type Assoc;
@@ -12,6 +12,8 @@ fn test<T: Foo<Assoc = <T as Foo>::Assoc>>() {
     //~^ ERROR overflow evaluating the requirement `<T as Foo>::Assoc == _`
     //~| ERROR overflow evaluating the requirement `<T as Foo>::Assoc == _`
     //~| ERROR overflow evaluating the requirement `<T as Foo>::Assoc == _`
+    //~| ERROR overflow evaluating the requirement `<T as Foo>::Assoc == _`
+    //~| ERROR overflow evaluating the requirement `<T as Foo>::Assoc: Sized`
     //~| ERROR overflow evaluating the requirement `<T as Foo>::Assoc: Bar`
 }
 

@@ -57,14 +57,13 @@ const BASE_FN: &[&str] = &[
 
 /// DepNodes for Hir, which is pretty much everything
 const BASE_HIR: &[&str] = &[
-    // hir_owner and hir_owner_nodes should be computed for all nodes
-    label_strs::hir_owner,
-    label_strs::hir_owner_nodes,
+    // opt_hir_owner_nodes should be computed for all nodes
+    label_strs::opt_hir_owner_nodes,
 ];
 
 /// `impl` implementation of struct/trait
 const BASE_IMPL: &[&str] =
-    &[label_strs::associated_item_def_ids, label_strs::generics_of, label_strs::impl_trait_ref];
+    &[label_strs::associated_item_def_ids, label_strs::generics_of, label_strs::impl_trait_header];
 
 /// DepNodes for mir_built/Optimized, which is relevant in "executable"
 /// code, i.e., functions+methods

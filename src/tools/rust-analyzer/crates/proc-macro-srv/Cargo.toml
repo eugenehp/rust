@@ -29,6 +29,7 @@ paths.workspace = true
 base-db.workspace = true
 span.workspace = true
 proc-macro-api.workspace = true
+ra-ap-rustc_lexer.workspace = true
 
 [dev-dependencies]
 expect-test = "1.4.0"
@@ -37,7 +38,7 @@ expect-test = "1.4.0"
 proc-macro-test.path = "./proc-macro-test"
 
 [features]
-sysroot-abi = ["proc-macro-test/sysroot-abi"]
+sysroot-abi = []
 in-rust-tree = ["mbe/in-rust-tree", "sysroot-abi"]
 
 [lints]

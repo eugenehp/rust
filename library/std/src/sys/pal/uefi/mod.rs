@@ -14,35 +14,26 @@
 
 pub mod alloc;
 pub mod args;
-#[path = "../unix/cmath.rs"]
-pub mod cmath;
 pub mod env;
 #[path = "../unsupported/fs.rs"]
 pub mod fs;
 #[path = "../unsupported/io.rs"]
 pub mod io;
-#[path = "../unsupported/locks/mod.rs"]
-pub mod locks;
 #[path = "../unsupported/net.rs"]
 pub mod net;
 #[path = "../unsupported/once.rs"]
 pub mod once;
 pub mod os;
-#[path = "../windows/os_str.rs"]
-pub mod os_str;
-pub mod path;
 #[path = "../unsupported/pipe.rs"]
 pub mod pipe;
 #[path = "../unsupported/process.rs"]
 pub mod process;
 pub mod stdio;
-#[path = "../unsupported/thread.rs"]
 pub mod thread;
 #[path = "../unsupported/thread_local_key.rs"]
 pub mod thread_local_key;
 #[path = "../unsupported/thread_parking.rs"]
 pub mod thread_parking;
-#[path = "../unsupported/time.rs"]
 pub mod time;
 
 mod helpers;

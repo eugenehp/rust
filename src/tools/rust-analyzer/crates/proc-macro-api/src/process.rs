@@ -1,11 +1,13 @@
 //! Handle process life-time and message passing for proc-macro client
 
 use std::{
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::Arc,
 };
 
 use paths::{AbsPath, AbsPathBuf};
+use rustc_hash::FxHashMap;
 use stdx::JodChild;
 
 use crate::{
@@ -15,23 +17,29 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct ProcMacroProcessSrv {
-    _process: Process,
+    process: Process,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Populated when the server exits.
+    server_exited: Option<ServerError>,
     version: u32,
     mode: SpanMode,
 }
 
 impl ProcMacroProcessSrv {
-    pub(crate) fn run(process_path: AbsPathBuf) -> io::Result<ProcMacroProcessSrv> {
+    pub(crate) fn run(
+        process_path: AbsPathBuf,
+        env: &FxHashMap<String, String>,
+    ) -> io::Result<ProcMacroProcessSrv> {
         let create_srv = |null_stderr| {
-            let mut process = Process::run(process_path.clone(), null_stderr)?;
+            let mut process = Process::run(process_path.clone(), env, null_stderr)?;
             let (stdin, stdout) = process.stdio().expect("couldn't access child stdio");
 
             io::Result::Ok(ProcMacroProcessSrv {
-                _process: process,
+                process,
                 stdin,
                 stdout,
+                server_exited: None,
                 version: 0,
                 mode: SpanMode::Id,
             })
@@ -74,7 +82,7 @@ impl ProcMacroProcessSrv {
 
         match response {
             Response::ApiVersionCheck(version) => Ok(version),
-            _ => Err(ServerError { message: "unexpected response".to_string(), io: None }),
+            _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
         }
     }
 
@@ -86,7 +94,7 @@ impl ProcMacroProcessSrv {
 
         match response {
             Response::SetConfig(crate::msg::ServerConfig { span_mode }) => Ok(span_mode),
-            _ => Err(ServerError { message: "unexpected response".to_string(), io: None }),
+            _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
         }
     }
 
@@ -100,13 +108,40 @@ impl ProcMacroProcessSrv {
 
         match response {
             Response::ListMacros(it) => Ok(it),
-            _ => Err(ServerError { message: "unexpected response".to_string(), io: None }),
+            _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
         }
     }
 
     pub(crate) fn send_task(&mut self, req: Request) -> Result<Response, ServerError> {
+        if let Some(server_error) = &self.server_exited {
+            return Err(server_error.clone());
+        }
+
         let mut buf = String::new();
-        send_request(&mut self.stdin, &mut self.stdout, req, &mut buf)
+        send_request(&mut self.stdin, &mut self.stdout, req, &mut buf).map_err(|e| {
+            if e.io.as_ref().map(|it| it.kind()) == Some(io::ErrorKind::BrokenPipe) {
+                match self.process.child.try_wait() {
+                    Ok(None) => e,
+                    Ok(Some(status)) => {
+                        let mut msg = String::new();
+                        if !status.success() {
+                            if let Some(stderr) = self.process.child.stderr.as_mut() {
+                                _ = stderr.read_to_string(&mut msg);
+                            }
+                        }
+                        let server_error = ServerError {
+                            message: format!("server exited with {status}: {msg}"),
+                            io: None,
+                        };
+                        self.server_exited = Some(server_error.clone());
+                        server_error
+                    }
+                    Err(_) => e,
+                }
+            } else {
+                e
+            }
+        })
     }
 }
 
@@ -116,8 +151,12 @@ struct Process {
 }
 
 impl Process {
-    fn run(path: AbsPathBuf, null_stderr: bool) -> io::Result<Process> {
-        let child = JodChild(mk_child(&path, null_stderr)?);
+    fn run(
+        path: AbsPathBuf,
+        env: &FxHashMap<String, String>,
+        null_stderr: bool,
+    ) -> io::Result<Process> {
+        let child = JodChild(mk_child(&path, env, null_stderr)?);
         Ok(Process { child })
     }
 
@@ -130,13 +169,25 @@ impl Process {
     }
 }
 
-fn mk_child(path: &AbsPath, null_stderr: bool) -> io::Result<Child> {
-    Command::new(path.as_os_str())
+fn mk_child(
+    path: &AbsPath,
+    env: &FxHashMap<String, String>,
+    null_stderr: bool,
+) -> io::Result<Child> {
+    let mut cmd = Command::new(path.as_os_str());
+    cmd.envs(env)
         .env("RUST_ANALYZER_INTERNALS_DO_NOT_USE", "this is unstable")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(if null_stderr { Stdio::null() } else { Stdio::inherit() })
-        .spawn()
+        .stderr(if null_stderr { Stdio::null() } else { Stdio::inherit() });
+    if cfg!(windows) {
+        let mut path_var = std::ffi::OsString::new();
+        path_var.push(path.parent().unwrap().parent().unwrap().as_os_str());
+        path_var.push("\\bin;");
+        path_var.push(std::env::var_os("PATH").unwrap_or_default());
+        cmd.env("PATH", path_var);
+    }
+    cmd.spawn()
 }
 
 fn send_request(
@@ -145,9 +196,13 @@ fn send_request(
     req: Request,
     buf: &mut String,
 ) -> Result<Response, ServerError> {
-    req.write(&mut writer)
-        .map_err(|err| ServerError { message: "failed to write request".into(), io: Some(err) })?;
-    let res = Response::read(&mut reader, buf)
-        .map_err(|err| ServerError { message: "failed to read response".into(), io: Some(err) })?;
+    req.write(&mut writer).map_err(|err| ServerError {
+        message: "failed to write request".into(),
+        io: Some(Arc::new(err)),
+    })?;
+    let res = Response::read(&mut reader, buf).map_err(|err| ServerError {
+        message: "failed to read response".into(),
+        io: Some(Arc::new(err)),
+    })?;
     res.ok_or_else(|| ServerError { message: "server exited".into(), io: None })
 }

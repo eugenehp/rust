@@ -3,6 +3,7 @@
 use crate::helpers::mod_path_to_ast;
 use either::Either;
 use hir::{AsAssocItem, HirDisplay, ModuleDef, SemanticsScope};
+use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use syntax::{
     ast::{self, make, AstNode},
@@ -147,7 +148,7 @@ impl<'a> PathTransform<'a> {
         let mut defaulted_params: Vec<DefaultedParam> = Default::default();
         self.generic_def
             .into_iter()
-            .flat_map(|it| it.type_params(db))
+            .flat_map(|it| it.type_or_const_params(db))
             .skip(skip)
             // The actual list of trait type parameters may be longer than the one
             // used in the `impl` block due to trailing default type parameters.
@@ -227,11 +228,15 @@ struct Ctx<'a> {
     same_self_type: bool,
 }
 
-fn postorder(item: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
-    item.preorder().filter_map(|event| match event {
-        syntax::WalkEvent::Enter(_) => None,
-        syntax::WalkEvent::Leave(node) => Some(node),
-    })
+fn preorder_rev(item: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
+    let x = item
+        .preorder()
+        .filter_map(|event| match event {
+            syntax::WalkEvent::Enter(node) => Some(node),
+            syntax::WalkEvent::Leave(_) => None,
+        })
+        .collect_vec();
+    x.into_iter().rev()
 }
 
 impl Ctx<'_> {
@@ -239,12 +244,12 @@ impl Ctx<'_> {
         // `transform_path` may update a node's parent and that would break the
         // tree traversal. Thus all paths in the tree are collected into a vec
         // so that such operation is safe.
-        let paths = postorder(item).filter_map(ast::Path::cast).collect::<Vec<_>>();
+        let paths = preorder_rev(item).filter_map(ast::Path::cast).collect::<Vec<_>>();
         for path in paths {
             self.transform_path(path);
         }
 
-        postorder(item).filter_map(ast::Lifetime::cast).for_each(|lifetime| {
+        preorder_rev(item).filter_map(ast::Lifetime::cast).for_each(|lifetime| {
             if let Some(subst) = self.lifetime_substs.get(&lifetime.syntax().text().to_string()) {
                 ted::replace(lifetime.syntax(), subst.clone_subtree().clone_for_update().syntax());
             }
@@ -263,7 +268,7 @@ impl Ctx<'_> {
             // `transform_path` may update a node's parent and that would break the
             // tree traversal. Thus all paths in the tree are collected into a vec
             // so that such operation is safe.
-            let paths = postorder(value).filter_map(ast::Path::cast).collect::<Vec<_>>();
+            let paths = preorder_rev(value).filter_map(ast::Path::cast).collect::<Vec<_>>();
             for path in paths {
                 self.transform_path(path);
             }
@@ -376,7 +381,7 @@ impl Ctx<'_> {
                         true,
                     )
                     .ok()?;
-                let ast_ty = make::ty(&ty_str).clone_for_update();
+                let ast_ty = make::ty(ty_str).clone_for_update();
 
                 if let Some(adt) = ty.as_adt() {
                     if let ast::Type::PathType(path_ty) = &ast_ty {

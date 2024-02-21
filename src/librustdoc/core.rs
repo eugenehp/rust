@@ -3,7 +3,7 @@ use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::unord::UnordSet;
 use rustc_errors::emitter::{DynEmitter, HumanEmitter};
 use rustc_errors::json::JsonEmitter;
-use rustc_errors::TerminalUrl;
+use rustc_errors::{codes::*, TerminalUrl};
 use rustc_feature::UnstableFeatures;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{DefId, DefIdMap, DefIdSet, LocalDefId};
@@ -44,10 +44,13 @@ pub(crate) struct DocContext<'tcx> {
     /// Used while populating `external_traits` to ensure we don't process the same trait twice at
     /// the same time.
     pub(crate) active_extern_traits: DefIdSet,
-    // The current set of parameter substitutions,
-    // for expanding type aliases at the HIR level:
-    /// Table `DefId` of type, lifetime, or const parameter -> substituted type, lifetime, or const
-    pub(crate) args: DefIdMap<clean::SubstParam>,
+    /// The current set of parameter instantiations for expanding type aliases at the HIR level.
+    ///
+    /// Maps from the `DefId` of a lifetime or type parameter to the
+    /// generic argument it's currently instantiated to in this context.
+    // FIXME(#82852): We don't record const params since we don't visit const exprs at all and
+    // therefore wouldn't use the corresp. generic arg anyway. Add support for them.
+    pub(crate) args: DefIdMap<clean::GenericArg>,
     pub(crate) current_type_aliases: DefIdMap<usize>,
     /// Table synthetic type parameter for `impl Trait` in argument position -> bounds
     pub(crate) impl_trait_bounds: FxHashMap<ImplTraitParam, Vec<clean::GenericBound>>,
@@ -84,10 +87,10 @@ impl<'tcx> DocContext<'tcx> {
     }
 
     /// Call the closure with the given parameters set as
-    /// the substitutions for a type alias' RHS.
+    /// the generic parameters for a type alias' RHS.
     pub(crate) fn enter_alias<F, R>(
         &mut self,
-        args: DefIdMap<clean::SubstParam>,
+        args: DefIdMap<clean::GenericArg>,
         def_id: DefId,
         f: F,
     ) -> R
@@ -377,7 +380,7 @@ pub(crate) fn run_global_ctxt(
             {}/rustdoc/how-to-write-documentation.html",
             crate::DOC_RUST_LANG_ORG_CHANNEL
         );
-        tcx.struct_lint_node(
+        tcx.node_lint(
             crate::lint::MISSING_CRATE_LEVEL_DOCS,
             DocContext::as_local_hir_id(tcx, krate.module.item_id).unwrap(),
             "no documentation found for this crate's top-level module",
@@ -449,6 +452,7 @@ pub(crate) fn run_global_ctxt(
 
     tcx.sess.time("check_lint_expectations", || tcx.check_expectations(Some(sym::rustdoc)));
 
+    // We must include lint errors here.
     if tcx.dcx().has_errors_or_lint_errors().is_some() {
         rustc_errors::FatalError.raise();
     }

@@ -1,6 +1,5 @@
 //! Builtin derives.
 
-use base_db::{CrateOrigin, LangCrateOrigin};
 use itertools::izip;
 use rustc_hash::FxHashSet;
 use span::{MacroCallId, Span};
@@ -10,6 +9,7 @@ use tracing::debug;
 use crate::{
     hygiene::span_with_def_site_ctxt,
     name::{AsName, Name},
+    quote::dollar_crate,
     span_map::SpanMapRef,
     tt,
 };
@@ -38,7 +38,7 @@ macro_rules! register_builtin {
 
                 let span = db.lookup_intern_macro_call(id).call_site;
                 let span = span_with_def_site_ctxt(db, span, id);
-                expander(db, id, span, tt, token_map)
+                expander(span, tt, token_map)
             }
 
             fn find_by_name(name: &name::Name) -> Option<Self> {
@@ -194,6 +194,7 @@ struct BasicAdtInfo {
     /// second field is `Some(ty)` if it's a const param of type `ty`, `None` if it's a type param.
     /// third fields is where bounds, if any
     param_types: Vec<(tt::Subtree, Option<tt::Subtree>, Option<tt::Subtree>)>,
+    where_clause: Vec<tt::Subtree>,
     associated_types: Vec<tt::Subtree>,
 }
 
@@ -202,10 +203,11 @@ fn parse_adt(
     adt: &ast::Adt,
     call_site: Span,
 ) -> Result<BasicAdtInfo, ExpandError> {
-    let (name, generic_param_list, shape) = match adt {
+    let (name, generic_param_list, where_clause, shape) = match adt {
         ast::Adt::Struct(it) => (
             it.name(),
             it.generic_param_list(),
+            it.where_clause(),
             AdtShape::Struct(VariantShape::from(tm, it.field_list())?),
         ),
         ast::Adt::Enum(it) => {
@@ -217,6 +219,7 @@ fn parse_adt(
             (
                 it.name(),
                 it.generic_param_list(),
+                it.where_clause(),
                 AdtShape::Enum {
                     default_variant,
                     variants: it
@@ -233,7 +236,9 @@ fn parse_adt(
                 },
             )
         }
-        ast::Adt::Union(it) => (it.name(), it.generic_param_list(), AdtShape::Union),
+        ast::Adt::Union(it) => {
+            (it.name(), it.generic_param_list(), it.where_clause(), AdtShape::Union)
+        }
     };
 
     let mut param_type_set: FxHashSet<Name> = FxHashSet::default();
@@ -274,6 +279,14 @@ fn parse_adt(
         })
         .collect();
 
+    let where_clause = if let Some(w) = where_clause {
+        w.predicates()
+            .map(|it| mbe::syntax_node_to_token_tree(it.syntax(), tm, call_site))
+            .collect()
+    } else {
+        vec![]
+    };
+
     // For a generic parameter `T`, when shorthand associated type `T::Assoc` appears in field
     // types (of any variant for enums), we generate trait bound for it. It sounds reasonable to
     // also generate trait bound for qualified associated type `<T as Trait>::Assoc`, but rustc
@@ -301,7 +314,7 @@ fn parse_adt(
         .map(|it| mbe::syntax_node_to_token_tree(it.syntax(), tm, call_site))
         .collect();
     let name_token = name_to_token(tm, name)?;
-    Ok(BasicAdtInfo { name: name_token, shape, param_types, associated_types })
+    Ok(BasicAdtInfo { name: name_token, shape, param_types, where_clause, associated_types })
 }
 
 fn name_to_token(
@@ -366,7 +379,8 @@ fn expand_simple_derive(
         }
     };
     let trait_body = make_trait_body(&info);
-    let mut where_block = vec![];
+    let mut where_block: Vec<_> =
+        info.where_clause.into_iter().map(|w| quote! {invoc_span => #w , }).collect();
     let (params, args): (Vec<_>, Vec<_>) = info
         .param_types
         .into_iter()
@@ -398,41 +412,13 @@ fn expand_simple_derive(
     ExpandResult::ok(expanded)
 }
 
-fn find_builtin_crate(db: &dyn ExpandDatabase, id: MacroCallId, span: Span) -> tt::TokenTree {
-    // FIXME: make hygiene works for builtin derive macro
-    // such that $crate can be used here.
-    let cg = db.crate_graph();
-    let krate = db.lookup_intern_macro_call(id).krate;
-
-    let tt = if matches!(cg[krate].origin, CrateOrigin::Lang(LangCrateOrigin::Core)) {
-        cov_mark::hit!(test_copy_expand_in_core);
-        quote! {span => crate }
-    } else {
-        quote! {span => core }
-    };
-
-    tt.token_trees[0].clone()
-}
-
-fn copy_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = find_builtin_crate(db, id, span);
+fn copy_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::marker::Copy }, |_| quote! {span =>})
 }
 
-fn clone_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = find_builtin_crate(db, id, span);
+fn clone_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::clone::Clone }, |adt| {
         if matches!(adt.shape, AdtShape::Union) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
@@ -453,7 +439,7 @@ fn clone_expand(
         let name = &adt.name;
         let patterns = adt.shape.as_pattern(span, name);
         let exprs = adt.shape.as_pattern_map(name, |it| quote! {span => #it .clone() }, span);
-        let arms = patterns.into_iter().zip(exprs.into_iter()).map(|(pat, expr)| {
+        let arms = patterns.into_iter().zip(exprs).map(|(pat, expr)| {
             let fat_arrow = fat_arrow(span);
             quote! {span =>
                 #pat #fat_arrow #expr,
@@ -482,14 +468,8 @@ fn and_and(span: Span) -> tt::Subtree {
     quote! {span => #and& }
 }
 
-fn default_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = &find_builtin_crate(db, id, span);
+fn default_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = &dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::default::Default }, |adt| {
         let body = match &adt.shape {
             AdtShape::Struct(fields) => {
@@ -527,14 +507,8 @@ fn default_expand(
     })
 }
 
-fn debug_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = &find_builtin_crate(db, id, span);
+fn debug_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = &dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::fmt::Debug }, |adt| {
         let for_variant = |name: String, v: &VariantShape| match v {
             VariantShape::Struct(fields) => {
@@ -605,14 +579,8 @@ fn debug_expand(
     })
 }
 
-fn hash_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = &find_builtin_crate(db, id, span);
+fn hash_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = &dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::hash::Hash }, |adt| {
         if matches!(adt.shape, AdtShape::Union) {
             // FIXME: Return expand error here
@@ -658,25 +626,13 @@ fn hash_expand(
     })
 }
 
-fn eq_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = find_builtin_crate(db, id, span);
+fn eq_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::cmp::Eq }, |_| quote! {span =>})
 }
 
-fn partial_eq_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = find_builtin_crate(db, id, span);
+fn partial_eq_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::cmp::PartialEq }, |adt| {
         if matches!(adt.shape, AdtShape::Union) {
             // FIXME: Return expand error here
@@ -747,17 +703,11 @@ fn self_and_other_patterns(
     (self_patterns, other_patterns)
 }
 
-fn ord_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = &find_builtin_crate(db, id, span);
+fn ord_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = &dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::cmp::Ord }, |adt| {
         fn compare(
-            krate: &tt::TokenTree,
+            krate: &tt::Ident,
             left: tt::Subtree,
             right: tt::Subtree,
             rest: tt::Subtree,
@@ -811,17 +761,11 @@ fn ord_expand(
     })
 }
 
-fn partial_ord_expand(
-    db: &dyn ExpandDatabase,
-    id: MacroCallId,
-    span: Span,
-    tt: &ast::Adt,
-    tm: SpanMapRef<'_>,
-) -> ExpandResult<tt::Subtree> {
-    let krate = &find_builtin_crate(db, id, span);
+fn partial_ord_expand(span: Span, tt: &ast::Adt, tm: SpanMapRef<'_>) -> ExpandResult<tt::Subtree> {
+    let krate = &dollar_crate(span);
     expand_simple_derive(span, tt, tm, quote! {span => #krate::cmp::PartialOrd }, |adt| {
         fn compare(
-            krate: &tt::TokenTree,
+            krate: &tt::Ident,
             left: tt::Subtree,
             right: tt::Subtree,
             rest: tt::Subtree,

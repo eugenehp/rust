@@ -25,13 +25,13 @@ mod bind_pat;
 mod binding_mode;
 mod chaining;
 mod closing_brace;
-mod closure_ret;
 mod closure_captures;
+mod closure_ret;
 mod discriminant;
 mod fn_lifetime_fn;
+mod implicit_drop;
 mod implicit_static;
 mod param_name;
-mod implicit_drop;
 mod range_exclusive;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,7 +357,7 @@ fn label_of_ty(
         label_builder: &mut InlayHintLabelBuilder<'_>,
         config: &InlayHintsConfig,
     ) -> Result<(), HirDisplayError> {
-        let iter_item_type = hint_iterator(sema, famous_defs, &ty);
+        let iter_item_type = hint_iterator(sema, famous_defs, ty);
         match iter_item_type {
             Some((iter_trait, item, ty)) => {
                 const LABEL_START: &str = "impl ";
@@ -454,7 +454,7 @@ pub(crate) fn inlay_hints(
     range_limit: Option<RangeLimit>,
     config: &InlayHintsConfig,
 ) -> Vec<InlayHint> {
-    let _p = profile::span("inlay_hints");
+    let _p = tracing::span!(tracing::Level::INFO, "inlay_hints").entered();
     let sema = Semantics::new(db);
     let file = sema.parse(file_id);
     let file = file.syntax();

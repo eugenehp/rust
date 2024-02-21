@@ -9,19 +9,22 @@ use hir_def::{
         Abi, FieldsShape, Integer, LayoutCalculator, LayoutS, Primitive, ReprOptions, Scalar, Size,
         StructKind, TargetDataLayout, WrappingRange,
     },
-    LocalEnumVariantId, LocalFieldId, StructId,
+    LocalFieldId, StructId,
 };
 use la_arena::{Idx, RawIdx};
-use rustc_dependencies::{
-    abi::AddressSpace,
-    index::{IndexSlice, IndexVec},
-};
+use rustc_abi::AddressSpace;
+use rustc_index::{IndexSlice, IndexVec};
+
 use stdx::never;
 use triomphe::Arc;
 
 use crate::{
-    consteval::try_const_usize, db::HirDatabase, infer::normalize, layout::adt::struct_variant_idx,
-    utils::ClosureSubst, Interner, ProjectionTy, Substitution, TraitEnvironment, Ty,
+    consteval::try_const_usize,
+    db::{HirDatabase, InternedClosure},
+    infer::normalize,
+    layout::adt::struct_variant_idx,
+    utils::ClosureSubst,
+    Interner, ProjectionTy, Substitution, TraitEnvironment, Ty,
 };
 
 pub use self::{
@@ -33,15 +36,15 @@ mod adt;
 mod target;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RustcEnumVariantIdx(pub LocalEnumVariantId);
+pub struct RustcEnumVariantIdx(pub usize);
 
-impl rustc_dependencies::index::Idx for RustcEnumVariantIdx {
+impl rustc_index::Idx for RustcEnumVariantIdx {
     fn new(idx: usize) -> Self {
-        RustcEnumVariantIdx(Idx::from_raw(RawIdx::from(idx as u32)))
+        RustcEnumVariantIdx(idx)
     }
 
     fn index(self) -> usize {
-        u32::from(self.0.into_raw()) as usize
+        self.0
     }
 }
 
@@ -54,7 +57,7 @@ impl RustcFieldIdx {
     }
 }
 
-impl rustc_dependencies::index::Idx for RustcFieldIdx {
+impl rustc_index::Idx for RustcFieldIdx {
     fn new(idx: usize) -> Self {
         RustcFieldIdx(Idx::from_raw(RawIdx::from(idx as u32)))
     }
@@ -199,11 +202,11 @@ pub fn layout_of_ty_query(
     trait_env: Arc<TraitEnvironment>,
 ) -> Result<Arc<Layout>, LayoutError> {
     let krate = trait_env.krate;
-    let Some(target) = db.target_data_layout(krate) else {
+    let Ok(target) = db.target_data_layout(krate) else {
         return Err(LayoutError::TargetLayoutNotAvailable);
     };
     let cx = LayoutCx { target: &target };
-    let dl = &*cx.current_data_layout();
+    let dl = cx.current_data_layout();
     let ty = normalize(db, trait_env.clone(), ty);
     let result = match ty.kind(Interner) {
         TyKind::Adt(AdtId(def), subst) => {
@@ -279,7 +282,7 @@ pub fn layout_of_ty_query(
             cx.univariant(dl, &fields, &ReprOptions::default(), kind).ok_or(LayoutError::Unknown)?
         }
         TyKind::Array(element, count) => {
-            let count = try_const_usize(db, &count).ok_or(LayoutError::HasErrorConst)? as u64;
+            let count = try_const_usize(db, count).ok_or(LayoutError::HasErrorConst)? as u64;
             let element = db.layout_of_ty(element.clone(), trait_env)?;
             let size = element.size.checked_mul(count, dl).ok_or(LayoutError::SizeOverflow)?;
 
@@ -392,7 +395,7 @@ pub fn layout_of_ty_query(
             }
         }
         TyKind::Closure(c, subst) => {
-            let (def, _) = db.lookup_intern_closure((*c).into());
+            let InternedClosure(def, _) = db.lookup_intern_closure((*c).into());
             let infer = db.infer(def);
             let (captures, _) = infer.closure_info(c);
             let fields = captures
@@ -409,7 +412,7 @@ pub fn layout_of_ty_query(
             cx.univariant(dl, &fields, &ReprOptions::default(), StructKind::AlwaysSized)
                 .ok_or(LayoutError::Unknown)?
         }
-        TyKind::Generator(_, _) | TyKind::GeneratorWitness(_, _) => {
+        TyKind::Coroutine(_, _) | TyKind::CoroutineWitness(_, _) => {
             return Err(LayoutError::NotImplemented)
         }
         TyKind::Error => return Err(LayoutError::HasErrorType),

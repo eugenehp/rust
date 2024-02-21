@@ -14,15 +14,16 @@ use rustc_data_structures::flock;
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::jobserver::{self, Client};
 use rustc_data_structures::profiling::{SelfProfiler, SelfProfilerRef};
-use rustc_data_structures::sync::{AtomicU64, DynSend, DynSync, Lock, Lrc, OneThread};
+use rustc_data_structures::sync::{
+    AtomicU64, DynSend, DynSync, Lock, Lrc, MappedReadGuard, ReadGuard, RwLock,
+};
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
 use rustc_errors::emitter::{DynEmitter, HumanEmitter, HumanReadableErrorType};
 use rustc_errors::json::JsonEmitter;
 use rustc_errors::registry::Registry;
 use rustc_errors::{
-    error_code, fallback_fluent_bundle, DiagCtxt, DiagnosticBuilder, DiagnosticId,
-    DiagnosticMessage, ErrorGuaranteed, FatalAbort, FluentBundle, IntoDiagnostic,
-    LazyFallbackBundle, TerminalUrl,
+    codes::*, fallback_fluent_bundle, DiagCtxt, DiagnosticBuilder, DiagnosticMessage,
+    ErrorGuaranteed, FatalAbort, FluentBundle, IntoDiagnostic, LazyFallbackBundle, TerminalUrl,
 };
 use rustc_macros::HashStable_Generic;
 pub use rustc_span::def_id::StableCrateId;
@@ -36,7 +37,6 @@ use rustc_target::spec::{
 };
 
 use std::any::Any;
-use std::cell::{self, RefCell};
 use std::env;
 use std::fmt;
 use std::ops::{Div, Mul};
@@ -111,7 +111,7 @@ impl Mul<usize> for Limit {
 }
 
 impl rustc_errors::IntoDiagnosticArg for Limit {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
+    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
         self.to_string().into_diagnostic_arg()
     }
 }
@@ -150,7 +150,7 @@ pub struct Session {
     /// Input, input file path and output file path to this compilation process.
     pub io: CompilerIO,
 
-    incr_comp_session: OneThread<RefCell<IncrCompSession>>,
+    incr_comp_session: RwLock<IncrCompSession>,
 
     /// Used by `-Z self-profile`.
     pub prof: SelfProfilerRef,
@@ -288,19 +288,9 @@ impl Session {
     pub fn finish_diagnostics(&self, registry: &Registry) {
         self.check_miri_unleashed_features();
         self.dcx().print_error_count(registry);
-        self.emit_future_breakage();
-    }
-
-    fn emit_future_breakage(&self) {
-        if !self.opts.json_future_incompat {
-            return;
+        if self.opts.json_future_incompat {
+            self.dcx().emit_future_breakage_report();
         }
-
-        let diags = self.dcx().take_future_breakage_diagnostics();
-        if diags.is_empty() {
-            return;
-        }
-        self.dcx().emit_future_breakage_report(diags);
     }
 
     /// Returns true if the crate is a testing one.
@@ -316,39 +306,25 @@ impl Session {
     ) -> DiagnosticBuilder<'a> {
         let mut err = self.dcx().create_err(err);
         if err.code.is_none() {
-            err.code(error_code!(E0658));
+            err.code(E0658);
         }
         add_feature_diagnostics(&mut err, self, feature);
         err
     }
 
     pub fn compile_status(&self) -> Result<(), ErrorGuaranteed> {
+        // We must include lint errors here.
         if let Some(reported) = self.dcx().has_errors_or_lint_errors() {
-            let _ = self.dcx().emit_stashed_diagnostics();
+            self.dcx().emit_stashed_diagnostics();
             Err(reported)
         } else {
             Ok(())
         }
     }
 
-    // FIXME(matthewjasper) Remove this method, it should never be needed.
-    pub fn track_errors<F, T>(&self, f: F) -> Result<T, ErrorGuaranteed>
-    where
-        F: FnOnce() -> T,
-    {
-        let old_count = self.dcx().err_count();
-        let result = f();
-        if self.dcx().err_count() == old_count {
-            Ok(result)
-        } else {
-            Err(self.dcx().delayed_bug("`self.err_count()` changed but an error was not emitted"))
-        }
-    }
-
-    /// Used for code paths of expensive computations that should only take place when
-    /// warnings or errors are emitted. If no messages are emitted ("good path"), then
-    /// it's likely a bug.
-    pub fn good_path_delayed_bug(&self, msg: impl Into<DiagnosticMessage>) {
+    /// Record the fact that we called `trimmed_def_paths`, and do some
+    /// checking about whether its cost was justified.
+    pub fn record_trimmed_def_paths(&self) {
         if self.opts.unstable_opts.print_type_sizes
             || self.opts.unstable_opts.query_dep_graph
             || self.opts.unstable_opts.dump_mir.is_some()
@@ -359,7 +335,7 @@ impl Session {
             return;
         }
 
-        self.dcx().good_path_delayed_bug(msg)
+        self.dcx().set_must_produce_diag()
     }
 
     #[inline]
@@ -534,9 +510,9 @@ impl Session {
         *incr_comp_session = IncrCompSession::InvalidBecauseOfErrors { session_directory };
     }
 
-    pub fn incr_comp_session_dir(&self) -> cell::Ref<'_, PathBuf> {
+    pub fn incr_comp_session_dir(&self) -> MappedReadGuard<'_, PathBuf> {
         let incr_comp_session = self.incr_comp_session.borrow();
-        cell::Ref::map(incr_comp_session, |incr_comp_session| match *incr_comp_session {
+        ReadGuard::map(incr_comp_session, |incr_comp_session| match *incr_comp_session {
             IncrCompSession::NotInitialized => panic!(
                 "trying to get session directory from `IncrCompSession`: {:?}",
                 *incr_comp_session,
@@ -549,7 +525,7 @@ impl Session {
         })
     }
 
-    pub fn incr_comp_session_dir_opt(&self) -> Option<cell::Ref<'_, PathBuf>> {
+    pub fn incr_comp_session_dir_opt(&self) -> Option<MappedReadGuard<'_, PathBuf>> {
         self.opts.incremental.as_ref().map(|_| self.incr_comp_session_dir())
     }
 
@@ -569,8 +545,8 @@ impl Session {
                 if fuel.remaining == 0 && !fuel.out_of_fuel {
                     if self.dcx().can_emit_warnings() {
                         // We only call `msg` in case we can actually emit warnings.
-                        // Otherwise, this could cause a `good_path_delayed_bug` to
-                        // trigger (issue #79546).
+                        // Otherwise, this could cause a `must_produce_diag` ICE
+                        // (issue #79546).
                         self.dcx().emit_warn(errors::OptimisationFuelExhausted { msg: msg() });
                     }
                     fuel.out_of_fuel = true;
@@ -790,6 +766,13 @@ impl Session {
         self.opts.unstable_opts.tls_model.unwrap_or(self.target.tls_model)
     }
 
+    pub fn direct_access_external_data(&self) -> Option<bool> {
+        self.opts
+            .unstable_opts
+            .direct_access_external_data
+            .or(self.target.direct_access_external_data)
+    }
+
     pub fn split_debuginfo(&self) -> SplitDebuginfo {
         self.opts.cg.split_debuginfo.unwrap_or(self.target.split_debuginfo)
     }
@@ -906,7 +889,7 @@ impl Session {
         CodegenUnits::Default(16)
     }
 
-    pub fn teach(&self, code: &DiagnosticId) -> bool {
+    pub fn teach(&self, code: ErrCode) -> bool {
         self.opts.unstable_opts.teach && self.dcx().must_teach(code)
     }
 
@@ -1177,7 +1160,7 @@ pub fn build_session(
         parse_sess,
         sysroot,
         io,
-        incr_comp_session: OneThread::new(RefCell::new(IncrCompSession::NotInitialized)),
+        incr_comp_session: RwLock::new(IncrCompSession::NotInitialized),
         prof,
         code_stats: Default::default(),
         optimization_fuel,
@@ -1523,16 +1506,25 @@ pub trait RemapFileNameExt {
     where
         Self: 'a;
 
-    fn for_scope(&self, sess: &Session, scopes: RemapPathScopeComponents) -> Self::Output<'_>;
+    /// Returns a possibly remapped filename based on the passed scope and remap cli options.
+    ///
+    /// One and only one scope should be passed to this method. For anything related to
+    /// "codegen" see the [`RemapFileNameExt::for_codegen`] method.
+    fn for_scope(&self, sess: &Session, scope: RemapPathScopeComponents) -> Self::Output<'_>;
 
+    /// Return a possibly remapped filename, to be used in "codegen" related parts.
     fn for_codegen(&self, sess: &Session) -> Self::Output<'_>;
 }
 
 impl RemapFileNameExt for rustc_span::FileName {
     type Output<'a> = rustc_span::FileNameDisplay<'a>;
 
-    fn for_scope(&self, sess: &Session, scopes: RemapPathScopeComponents) -> Self::Output<'_> {
-        if sess.opts.unstable_opts.remap_path_scope.contains(scopes) {
+    fn for_scope(&self, sess: &Session, scope: RemapPathScopeComponents) -> Self::Output<'_> {
+        assert!(
+            scope.bits().count_ones() == 1,
+            "one and only one scope should be passed to for_scope"
+        );
+        if sess.opts.unstable_opts.remap_path_scope.contains(scope) {
             self.prefer_remapped_unconditionaly()
         } else {
             self.prefer_local()
@@ -1551,8 +1543,12 @@ impl RemapFileNameExt for rustc_span::FileName {
 impl RemapFileNameExt for rustc_span::RealFileName {
     type Output<'a> = &'a Path;
 
-    fn for_scope(&self, sess: &Session, scopes: RemapPathScopeComponents) -> Self::Output<'_> {
-        if sess.opts.unstable_opts.remap_path_scope.contains(scopes) {
+    fn for_scope(&self, sess: &Session, scope: RemapPathScopeComponents) -> Self::Output<'_> {
+        assert!(
+            scope.bits().count_ones() == 1,
+            "one and only one scope should be passed to for_scope"
+        );
+        if sess.opts.unstable_opts.remap_path_scope.contains(scope) {
             self.remapped_path_if_available()
         } else {
             self.local_path_if_available()

@@ -24,7 +24,7 @@ use rustc_hir::HirId;
 use rustc_index::IndexVec;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::lint::{
-    reveal_actual_level, struct_lint_level, LevelAndSource, LintExpectation, LintLevelSource,
+    lint_level, reveal_actual_level, LevelAndSource, LintExpectation, LintLevelSource,
     ShallowLintLevelMap,
 };
 use rustc_middle::query::Providers;
@@ -181,7 +181,7 @@ fn shallow_lint_levels_on(tcx: TyCtxt<'_>, owner: hir::OwnerId) -> ShallowLintLe
         // Otherwise, we need to visit the attributes in source code order, so we fetch HIR and do
         // a standard visit.
         // FIXME(#102522) Just iterate on attrs once that iteration order matches HIR's.
-        _ => match tcx.hir().owner(owner) {
+        _ => match tcx.hir_owner_node(owner) {
             hir::OwnerNode::Item(item) => levels.visit_item(item),
             hir::OwnerNode::ForeignItem(item) => levels.visit_foreign_item(item),
             hir::OwnerNode::TraitItem(item) => levels.visit_trait_item(item),
@@ -682,7 +682,7 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
                         sub,
                     });
                 } else {
-                    self.emit_spanned_lint(
+                    self.emit_span_lint(
                         FORBIDDEN_LINT_GROUPS,
                         src.span().into(),
                         OverruledAttributeLint {
@@ -925,7 +925,7 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
                             }
                             Err((Some(ids), ref new_lint_name)) => {
                                 let lint = builtin::RENAMED_AND_REMOVED_LINTS;
-                                self.emit_spanned_lint(
+                                self.emit_span_lint(
                                     lint,
                                     sp.into(),
                                     DeprecatedLintName {
@@ -976,13 +976,13 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
                             RenamedLintSuggestion::WithSpan { suggestion: sp, replace };
                         let name = tool_ident.map(|tool| format!("{tool}::{name}")).unwrap_or(name);
                         let lint = RenamedLint { name: name.as_str(), suggestion };
-                        self.emit_spanned_lint(RENAMED_AND_REMOVED_LINTS, sp.into(), lint);
+                        self.emit_span_lint(RENAMED_AND_REMOVED_LINTS, sp.into(), lint);
                     }
 
                     CheckLintNameResult::Removed(ref reason) => {
                         let name = tool_ident.map(|tool| format!("{tool}::{name}")).unwrap_or(name);
                         let lint = RemovedLint { name: name.as_str(), reason };
-                        self.emit_spanned_lint(RENAMED_AND_REMOVED_LINTS, sp.into(), lint);
+                        self.emit_span_lint(RENAMED_AND_REMOVED_LINTS, sp.into(), lint);
                     }
 
                     CheckLintNameResult::NoLint(suggestion) => {
@@ -995,7 +995,7 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
                             UnknownLintSuggestion::WithSpan { suggestion: sp, replace, from_rustc }
                         });
                         let lint = UnknownLint { name, suggestion };
-                        self.emit_spanned_lint(UNKNOWN_LINTS, sp.into(), lint);
+                        self.emit_span_lint(UNKNOWN_LINTS, sp.into(), lint);
                     }
                 }
                 // If this lint was renamed, apply the new lint instead of ignoring the attribute.
@@ -1041,7 +1041,7 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
                     continue;
                 };
 
-                self.emit_spanned_lint(
+                self.emit_span_lint(
                     UNUSED_ATTRIBUTES,
                     lint_attr_span.into(),
                     IgnoredUnlessCrateSpecified { level: level.as_str(), name: lint_attr_name },
@@ -1062,7 +1062,10 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
                 if self.lint_added_lints {
                     let lint = builtin::UNKNOWN_LINTS;
                     let (level, src) = self.lint_level(builtin::UNKNOWN_LINTS);
-                    struct_lint_level(
+                    // FIXME: make this translatable
+                    #[allow(rustc::diagnostic_outside_of_impl)]
+                    #[allow(rustc::untranslatable_diagnostic)]
+                    lint_level(
                         self.sess,
                         lint,
                         level,
@@ -1096,10 +1099,10 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
     /// Used to emit a lint-related diagnostic based on the current state of
     /// this lint context.
     ///
-    /// [`struct_lint_level`]: rustc_middle::lint::struct_lint_level#decorate-signature
+    /// [`lint_level`]: rustc_middle::lint::lint_level#decorate-signature
     #[rustc_lint_diagnostics]
     #[track_caller]
-    pub(crate) fn struct_lint(
+    pub(crate) fn opt_span_lint(
         &self,
         lint: &'static Lint,
         span: Option<MultiSpan>,
@@ -1107,18 +1110,18 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
         decorate: impl for<'a, 'b> FnOnce(&'b mut DiagnosticBuilder<'a, ()>),
     ) {
         let (level, src) = self.lint_level(lint);
-        struct_lint_level(self.sess, lint, level, src, span, msg, decorate)
+        lint_level(self.sess, lint, level, src, span, msg, decorate)
     }
 
     #[track_caller]
-    pub fn emit_spanned_lint(
+    pub fn emit_span_lint(
         &self,
         lint: &'static Lint,
         span: MultiSpan,
         decorate: impl for<'a> DecorateLint<'a, ()>,
     ) {
         let (level, src) = self.lint_level(lint);
-        struct_lint_level(self.sess, lint, level, src, Some(span), decorate.msg(), |lint| {
+        lint_level(self.sess, lint, level, src, Some(span), decorate.msg(), |lint| {
             decorate.decorate_lint(lint);
         });
     }
@@ -1126,7 +1129,7 @@ impl<'s, P: LintLevelsProvider> LintLevelsBuilder<'s, P> {
     #[track_caller]
     pub fn emit_lint(&self, lint: &'static Lint, decorate: impl for<'a> DecorateLint<'a, ()>) {
         let (level, src) = self.lint_level(lint);
-        struct_lint_level(self.sess, lint, level, src, None, decorate.msg(), |lint| {
+        lint_level(self.sess, lint, level, src, None, decorate.msg(), |lint| {
             decorate.decorate_lint(lint);
         });
     }

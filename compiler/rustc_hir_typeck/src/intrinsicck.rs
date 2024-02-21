@@ -1,5 +1,5 @@
 use hir::HirId;
-use rustc_errors::struct_span_code_err;
+use rustc_errors::{codes::*, struct_span_code_err};
 use rustc_hir as hir;
 use rustc_index::Idx;
 use rustc_middle::ty::layout::{LayoutError, SizeSkeleton};
@@ -48,8 +48,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let to = normalize(to);
         trace!(?from, ?to);
         if from.has_non_region_infer() || to.has_non_region_infer() {
-            tcx.dcx().span_delayed_bug(span, "argument to transmute has inference variables");
-            return;
+            // Note: this path is currently not reached in any test, so any
+            // example that triggers this would be worth minimizing and
+            // converting into a test.
+            tcx.dcx().span_bug(span, "argument to transmute has inference variables");
         }
         // Transmutes that are only changing lifetimes are always ok.
         if from == to {

@@ -1,21 +1,20 @@
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
+#![feature(const_type_name)]
 #![feature(cow_is_borrowed)]
 #![feature(decl_macro)]
+#![feature(impl_trait_in_assoc_type)]
+#![feature(inline_const)]
 #![feature(is_sorted)]
 #![feature(let_chains)]
 #![feature(map_try_insert)]
-#![feature(min_specialization)]
+#![cfg_attr(bootstrap, feature(min_specialization))]
 #![feature(never_type)]
 #![feature(option_get_or_insert_default)]
 #![feature(round_char_boundary)]
-#![feature(trusted_step)]
 #![feature(try_blocks)]
 #![feature(yeet_expr)]
 #![feature(if_let_guard)]
-#![recursion_limit = "256"]
 
 #[macro_use]
 extern crate tracing;
@@ -40,7 +39,7 @@ use rustc_middle::mir::{
 };
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
-use rustc_span::sym;
+use rustc_span::{source_map::Spanned, sym, DUMMY_SP};
 use rustc_trait_selection::traits;
 
 #[macro_use]
@@ -60,9 +59,6 @@ mod remove_place_mention;
 mod add_subtyping_projections;
 pub mod cleanup_post_borrowck;
 mod const_debuginfo;
-mod const_goto;
-mod const_prop;
-mod const_prop_lint;
 mod copy_prop;
 mod coroutine;
 mod cost_checker;
@@ -86,6 +82,7 @@ mod gvn;
 pub mod inline;
 mod instsimplify;
 mod jump_threading;
+mod known_panics_lint;
 mod large_enums;
 mod lint;
 mod lower_intrinsics;
@@ -104,7 +101,6 @@ mod remove_unneeded_drops;
 mod remove_zsts;
 mod required_consts;
 mod reveal_all;
-mod separate_const_switch;
 mod shim;
 mod ssa;
 // This pass is public to allow external drivers to perform MIR cleanup
@@ -164,18 +160,17 @@ fn remap_mir_for_const_eval_select<'tcx>(
                 fn_span,
                 ..
             } if let ty::FnDef(def_id, _) = *const_.ty().kind()
-                && tcx.item_name(def_id) == sym::const_eval_select
-                && tcx.is_intrinsic(def_id) =>
+                && matches!(tcx.intrinsic(def_id), Some(sym::const_eval_select)) =>
             {
                 let [tupled_args, called_in_const, called_at_rt]: [_; 3] =
                     std::mem::take(args).try_into().unwrap();
-                let ty = tupled_args.ty(&body.local_decls, tcx);
+                let ty = tupled_args.node.ty(&body.local_decls, tcx);
                 let fields = ty.tuple_fields();
                 let num_args = fields.len();
                 let func =
                     if context == hir::Constness::Const { called_in_const } else { called_at_rt };
                 let (method, place): (fn(Place<'tcx>) -> Operand<'tcx>, Place<'tcx>) =
-                    match tupled_args {
+                    match tupled_args.node {
                         Operand::Constant(_) => {
                             // there is no good way of extracting a tuple arg from a constant (const generic stuff)
                             // so we just create a temporary and deconstruct that.
@@ -184,7 +179,7 @@ fn remap_mir_for_const_eval_select<'tcx>(
                                 source_info: SourceInfo::outermost(fn_span),
                                 kind: StatementKind::Assign(Box::new((
                                     local.into(),
-                                    Rvalue::Use(tupled_args.clone()),
+                                    Rvalue::Use(tupled_args.node.clone()),
                                 ))),
                             });
                             (Operand::Move, local.into())
@@ -199,11 +194,11 @@ fn remap_mir_for_const_eval_select<'tcx>(
                         place_elems.push(ProjectionElem::Field(x.into(), fields[x]));
                         let projection = tcx.mk_place_elems(&place_elems);
                         let place = Place { local: place.local, projection };
-                        method(place)
+                        Spanned { node: method(place), span: DUMMY_SP }
                     })
                     .collect();
                 terminator.kind = TerminatorKind::Call {
-                    func,
+                    func: func.node,
                     args: arguments,
                     destination,
                     target,
@@ -268,6 +263,7 @@ fn mir_const_qualif(tcx: TyCtxt<'_>, def: LocalDefId) -> ConstQualifs {
     let body = &tcx.mir_const(def).borrow();
 
     if body.return_ty().references_error() {
+        // It's possible to reach here without an error being emitted (#121103).
         tcx.dcx().span_delayed_bug(body.span, "mir_const_qualif: MIR had errors");
         return Default::default();
     }
@@ -306,6 +302,10 @@ fn mir_const(tcx: TyCtxt<'_>, def: LocalDefId) -> &Steal<Body<'_>> {
             &Lint(check_packed_ref::CheckPackedRef),
             &Lint(check_const_item_mutation::CheckConstItemMutation),
             &Lint(function_item_references::FunctionItemReferences),
+            // If this is an async closure's output coroutine, generate
+            // by-move and by-mut bodies if needed. We do this first so
+            // they can be optimized in lockstep with their parent bodies.
+            &coroutine::ByMoveBody,
             // What we need to do constant evaluation.
             &simplify::SimplifyCfg::Initial,
             &rustc_peek::SanityCheck, // Just a lint
@@ -435,7 +435,7 @@ fn mir_drops_elaborated_and_const_checked(tcx: TyCtxt<'_>, def: LocalDefId) -> &
     //
     // We manually filter the predicates, skipping anything that's not
     // "global". We are in a potentially generic context
-    // (e.g. we are evaluating a function without substituting generic
+    // (e.g. we are evaluating a function without instantiating generic
     // parameters, so this filtering serves two purposes:
     //
     // 1. We skip evaluating any predicates that we would
@@ -533,7 +533,7 @@ fn run_runtime_lowering_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         &elaborate_box_derefs::ElaborateBoxDerefs,
         &coroutine::StateTransform,
         &add_retag::AddRetag,
-        &Lint(const_prop_lint::ConstPropLint),
+        &Lint(known_panics_lint::KnownPanicsLint),
     ];
     pm::run_passes_no_validate(tcx, body, passes, Some(MirPhase::Runtime(RuntimePhase::Initial)));
 }
@@ -575,10 +575,10 @@ fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
             &inline::Inline,
             // Code from other crates may have storage markers, so this needs to happen after inlining.
             &remove_storage_markers::RemoveStorageMarkers,
-            // Inlining and substitution may introduce ZST and useless drops.
+            // Inlining and instantiation may introduce ZST and useless drops.
             &remove_zsts::RemoveZsts,
             &remove_unneeded_drops::RemoveUnneededDrops,
-            // Type substitution may create uninhabited enums.
+            // Type instantiation may create uninhabited enums.
             &uninhabited_enum_branching::UninhabitedEnumBranching,
             &unreachable_prop::UnreachablePropagation,
             &o1(simplify::SimplifyCfg::AfterUninhabitedEnumBranching),
@@ -587,7 +587,6 @@ fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
 
             // Has to run after `slice::len` lowering
             &normalize_array_len::NormalizeArrayLen,
-            &const_goto::ConstGoto,
             &ref_prop::ReferencePropagation,
             &sroa::ScalarReplacementOfAggregates,
             &match_branches::MatchBranchSimplification,
@@ -595,11 +594,7 @@ fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
             &multiple_return_terminators::MultipleReturnTerminators,
             &instsimplify::InstSimplify,
             &simplify::SimplifyLocals::BeforeConstProp,
-            &copy_prop::CopyProp,
-            // Perform `SeparateConstSwitch` after SSA-based analyses, as cloning blocks may
-            // destroy the SSA property. It should still happen before const-propagation, so the
-            // latter pass will leverage the created opportunities.
-            &separate_const_switch::SeparateConstSwitch,
+            &dead_store_elimination::DeadStoreElimination::Initial,
             &gvn::GVN,
             &simplify::SimplifyLocals::AfterGVN,
             &dataflow_const_prop::DataflowConstProp,
@@ -608,11 +603,12 @@ fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
             &jump_threading::JumpThreading,
             &early_otherwise_branch::EarlyOtherwiseBranch,
             &simplify_comparison_integral::SimplifyComparisonIntegral,
-            &dead_store_elimination::DeadStoreElimination,
             &dest_prop::DestinationPropagation,
             &o1(simplify_branches::SimplifyConstCondition::Final),
             &o1(remove_noop_landing_pads::RemoveNoopLandingPads),
             &o1(simplify::SimplifyCfg::Final),
+            &copy_prop::CopyProp,
+            &dead_store_elimination::DeadStoreElimination::Final,
             &nrvo::RenameReturnPlace,
             &simplify::SimplifyLocals::Final,
             &multiple_return_terminators::MultipleReturnTerminators,
@@ -655,7 +651,6 @@ fn inner_optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> Body<'_> {
     debug!("about to call mir_drops_elaborated...");
     let body = tcx.mir_drops_elaborated_and_const_checked(did).steal();
     let mut body = remap_mir_for_const_eval_select(tcx, body, hir::Constness::NotConst);
-    debug!("body: {:#?}", body);
 
     if body.tainted_by_errors.is_some() {
         return body;
@@ -676,7 +671,7 @@ fn inner_optimized_mir(tcx: TyCtxt<'_>, did: LocalDefId) -> Body<'_> {
 }
 
 /// Fetch all the promoteds of an item and prepare their MIR bodies to be ready for
-/// constant evaluation once all substitutions become known.
+/// constant evaluation once all generic parameters become known.
 fn promoted_mir(tcx: TyCtxt<'_>, def: LocalDefId) -> &IndexVec<Promoted, Body<'_>> {
     if tcx.is_constructor(def.to_def_id()) {
         return tcx.arena.alloc(IndexVec::new());

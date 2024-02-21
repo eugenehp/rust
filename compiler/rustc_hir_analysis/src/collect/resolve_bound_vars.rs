@@ -8,12 +8,13 @@
 
 use rustc_ast::walk_list;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
-use rustc_errors::struct_span_code_err;
+use rustc_errors::{codes::*, struct_span_code_err};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{GenericArg, GenericParam, GenericParamKind, HirIdMap, LifetimeName, Node};
+use rustc_macros::extension;
 use rustc_middle::bug;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::resolve_bound_vars::*;
@@ -27,17 +28,8 @@ use std::fmt;
 
 use crate::errors;
 
-trait RegionExt {
-    fn early(param: &GenericParam<'_>) -> (LocalDefId, ResolvedArg);
-
-    fn late(index: u32, param: &GenericParam<'_>) -> (LocalDefId, ResolvedArg);
-
-    fn id(&self) -> Option<DefId>;
-
-    fn shifted(self, amount: u32) -> ResolvedArg;
-}
-
-impl RegionExt for ResolvedArg {
+#[extension(trait RegionExt)]
+impl ResolvedArg {
     fn early(param: &GenericParam<'_>) -> (LocalDefId, ResolvedArg) {
         debug!("ResolvedArg::early: def_id={:?}", param.def_id);
         (param.def_id, ResolvedArg::EarlyBound(param.def_id.to_def_id()))
@@ -254,7 +246,7 @@ fn resolve_bound_vars(tcx: TyCtxt<'_>, local_def_id: hir::OwnerId) -> ResolveBou
         map: &mut named_variable_map,
         scope: &Scope::Root { opt_parent_item: None },
     };
-    match tcx.hir().owner(local_def_id) {
+    match tcx.hir_owner_node(local_def_id) {
         hir::OwnerNode::Item(item) => visitor.visit_item(item),
         hir::OwnerNode::ForeignItem(item) => visitor.visit_foreign_item(item),
         hir::OwnerNode::TraitItem(item) => {
@@ -732,7 +724,7 @@ impl<'a, 'tcx> Visitor<'tcx> for BoundVarContext<'a, 'tcx> {
                     let Some(def_id) = def_id.as_local() else { continue };
                     let hir_id = self.tcx.local_def_id_to_hir_id(def_id);
                     // Ensure that the parent of the def is an item, not HRTB
-                    let parent_id = self.tcx.hir().parent_id(hir_id);
+                    let parent_id = self.tcx.parent_hir_id(hir_id);
                     if !parent_id.is_owner() {
                         struct_span_code_err!(
                             self.tcx.dcx(),
@@ -912,7 +904,7 @@ impl<'a, 'tcx> Visitor<'tcx> for BoundVarContext<'a, 'tcx> {
                             continue;
                         }
                         self.insert_lifetime(lt, ResolvedArg::StaticLifetime);
-                        self.tcx.struct_span_lint_hir(
+                        self.tcx.node_span_lint(
                             lint::builtin::UNUSED_LIFETIMES,
                             lifetime.hir_id,
                             lifetime.ident.span,
@@ -1339,7 +1331,7 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
             }
         }
 
-        self.tcx.dcx().span_delayed_bug(
+        self.tcx.dcx().span_bug(
             lifetime_ref.ident.span,
             format!("Could not resolve {:?} in scope {:#?}", lifetime_ref, self.scope,),
         );
@@ -1473,10 +1465,9 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
             }
         }
 
-        self.tcx.dcx().span_delayed_bug(
-            self.tcx.hir().span(hir_id),
-            format!("could not resolve {param_def_id:?}"),
-        );
+        self.tcx
+            .dcx()
+            .span_bug(self.tcx.hir().span(hir_id), format!("could not resolve {param_def_id:?}"));
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1786,7 +1777,8 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                 let bound_predicate = pred.kind();
                 match bound_predicate.skip_binder() {
                     ty::ClauseKind::Trait(data) => {
-                        // The order here needs to match what we would get from `subst_supertrait`
+                        // The order here needs to match what we would get from
+                        // `rustc_middle::ty::predicate::Clause::instantiate_supertrait`
                         let pred_bound_vars = bound_predicate.bound_vars();
                         let mut all_bound_vars = bound_vars.clone();
                         all_bound_vars.extend(pred_bound_vars.iter());
@@ -1872,7 +1864,8 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
         lifetime_ref: &'tcx hir::Lifetime,
         bad_def: ResolvedArg,
     ) {
-        let old_value = self.map.defs.remove(&lifetime_ref.hir_id);
+        // FIXME(#120456) - is `swap_remove` correct?
+        let old_value = self.map.defs.swap_remove(&lifetime_ref.hir_id);
         assert_eq!(old_value, Some(bad_def));
     }
 }

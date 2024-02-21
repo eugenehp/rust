@@ -40,6 +40,23 @@ pub enum DefDiagnosticKind {
     MacroDefError { ast: AstId<ast::Macro>, message: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefDiagnostics(Option<triomphe::Arc<Box<[DefDiagnostic]>>>);
+
+impl DefDiagnostics {
+    pub fn new(diagnostics: Vec<DefDiagnostic>) -> Self {
+        Self(if diagnostics.is_empty() {
+            None
+        } else {
+            Some(triomphe::Arc::new(diagnostics.into_boxed_slice()))
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DefDiagnostic> {
+        self.0.as_ref().into_iter().flat_map(|it| &***it)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct DefDiagnostic {
     pub in_module: LocalModuleId,
@@ -86,6 +103,9 @@ impl DefDiagnostic {
     }
 
     // FIXME: Whats the difference between this and unresolved_macro_call
+    // FIXME: This is used for a lot of things, unresolved proc macros, disabled proc macros, etc
+    // yet the diagnostic handler in ide-diagnostics has to figure out what happened because this
+    // struct loses all that information!
     pub(crate) fn unresolved_proc_macro(
         container: LocalModuleId,
         ast: MacroCallKind,

@@ -134,7 +134,7 @@ impl HirEqInterExpr<'_, '_, '_> {
     /// Checks whether two blocks are the same.
     #[expect(clippy::similar_names)]
     fn eq_block(&mut self, left: &Block<'_>, right: &Block<'_>) -> bool {
-        use TokenKind::{BlockComment, LineComment, Semi, Whitespace};
+        use TokenKind::{Semi, Whitespace};
         if left.stmts.len() != right.stmts.len() {
             return false;
         }
@@ -177,7 +177,7 @@ impl HirEqInterExpr<'_, '_, '_> {
                 return false;
             }
             if !eq_span_tokens(self.inner.cx, lstart..lstmt_span.lo, rstart..rstmt_span.lo, |t| {
-                !matches!(t, Whitespace | LineComment { .. } | BlockComment { .. } | Semi)
+                !matches!(t, Whitespace | Semi)
             }) {
                 return false;
             }
@@ -212,7 +212,7 @@ impl HirEqInterExpr<'_, '_, '_> {
             return false;
         }
         eq_span_tokens(self.inner.cx, lstart..lend, rstart..rend, |t| {
-            !matches!(t, Whitespace | LineComment { .. } | BlockComment { .. } | Semi)
+            !matches!(t, Whitespace | Semi)
         })
     }
 
@@ -515,6 +515,7 @@ impl HirEqInterExpr<'_, '_, '_> {
             (TyKind::Path(l), TyKind::Path(r)) => self.eq_qpath(l, r),
             (&TyKind::Tup(l), &TyKind::Tup(r)) => over(l, r, |l, r| self.eq_ty(l, r)),
             (&TyKind::Infer, &TyKind::Infer) => true,
+            (TyKind::AnonAdt(l_item_id), TyKind::AnonAdt(r_item_id)) => l_item_id == r_item_id,
             _ => false,
         }
     }
@@ -1007,7 +1008,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 }
                 e.hash(&mut self.s);
             },
-            PatKind::Never | PatKind::Wild => {},
+            PatKind::Never | PatKind::Wild | PatKind::Err(_) => {},
         }
     }
 
@@ -1108,7 +1109,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
             TyKind::Typeof(anon_const) => {
                 self.hash_body(anon_const.body);
             },
-            TyKind::Err(_) | TyKind::Infer | TyKind::Never | TyKind::InferDelegation(..) => {},
+            TyKind::Err(_) | TyKind::Infer | TyKind::Never | TyKind::InferDelegation(..) | TyKind::AnonAdt(_) => {},
         }
     }
 

@@ -11,16 +11,23 @@
 //!   rustc rather than `unstable`. (Although in general ABI compatibility is still an issue)…
 
 #![cfg(any(feature = "sysroot-abi", rust_analyzer))]
-#![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span, rustc_private)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span)]
 #![warn(rust_2018_idioms, unused_lifetimes)]
 #![allow(unreachable_pub, internal_features)]
 
 extern crate proc_macro;
+#[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
 
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
+
 mod dylib;
-mod server;
 mod proc_macros;
+mod server;
 
 use std::{
     collections::{hash_map::Entry, HashMap},

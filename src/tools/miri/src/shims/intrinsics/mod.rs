@@ -3,8 +3,7 @@ mod simd;
 
 use std::iter;
 
-use log::trace;
-
+use rand::Rng;
 use rustc_apfloat::{Float, Round};
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::{
@@ -107,12 +106,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "volatile_load" => {
                 let [place] = check_arg_count(args)?;
                 let place = this.deref_pointer(place)?;
-                this.copy_op(&place, dest, /*allow_transmute*/ false)?;
+                this.copy_op(&place, dest)?;
             }
             "volatile_store" => {
                 let [place, dest] = check_arg_count(args)?;
                 let place = this.deref_pointer(place)?;
-                this.copy_op(dest, &place, /*allow_transmute*/ false)?;
+                this.copy_op(dest, &place)?;
             }
 
             "write_bytes" | "volatile_set_memory" => {
@@ -139,6 +138,18 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let masked_addr = Size::from_bytes(ptr.addr().bytes() & mask);
 
                 this.write_pointer(Pointer::new(ptr.provenance, masked_addr), dest)?;
+            }
+
+            // We want to return either `true` or `false` at random, or else something like
+            // ```
+            // if !is_val_statically_known(0) { unreachable_unchecked(); }
+            // ```
+            // Would not be considered UB, or the other way around (`is_val_statically_known(0)`).
+            "is_val_statically_known" => {
+                let [arg] = check_arg_count(args)?;
+                this.validate_operand(arg)?;
+                let branch: bool = this.machine.rng.get_mut().gen();
+                this.write_scalar(Scalar::from_bool(branch), dest)?;
             }
 
             // Floating-point operations

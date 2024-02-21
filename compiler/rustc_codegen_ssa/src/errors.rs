@@ -4,7 +4,7 @@ use crate::assert_module_sources::CguReuse;
 use crate::back::command::Command;
 use crate::fluent_generated as fluent;
 use rustc_errors::{
-    DiagCtxt, DiagnosticArgValue, DiagnosticBuilder, EmissionGuarantee, IntoDiagnostic,
+    codes::*, DiagCtxt, DiagnosticArgValue, DiagnosticBuilder, EmissionGuarantee, IntoDiagnostic,
     IntoDiagnosticArg, Level,
 };
 use rustc_macros::Diagnostic;
@@ -122,6 +122,12 @@ pub struct NoNatvisDirectory {
 }
 
 #[derive(Diagnostic)]
+#[diag(codegen_ssa_no_saved_object_file)]
+pub struct NoSavedObjectFile<'a> {
+    pub cgu_name: &'a str,
+}
+
+#[derive(Diagnostic)]
 #[diag(codegen_ssa_copy_path_buf)]
 pub struct CopyPathBuf {
     pub source_file: PathBuf,
@@ -147,7 +153,7 @@ impl<'a> CopyPath<'a> {
 struct DebugArgPath<'a>(pub &'a Path);
 
 impl IntoDiagnosticArg for DebugArgPath<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
+    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue {
         DiagnosticArgValue::Str(Cow::Owned(format!("{:?}", self.0)))
     }
 }
@@ -356,8 +362,11 @@ impl<G: EmissionGuarantee> IntoDiagnostic<'_, G> for LinkingFailed<'_> {
         // which by now we have no way to translate.
         if contains_undefined_ref {
             diag.note(fluent::codegen_ssa_extern_funcs_not_found)
-                .note(fluent::codegen_ssa_specify_libraries_to_link)
-                .note(fluent::codegen_ssa_use_cargo_directive);
+                .note(fluent::codegen_ssa_specify_libraries_to_link);
+
+            if rustc_session::utils::was_invoked_from_cargo() {
+                diag.note(fluent::codegen_ssa_use_cargo_directive);
+            }
         }
         diag
     }
@@ -612,7 +621,7 @@ pub struct UnknownAtomicOperation;
 
 #[derive(Diagnostic)]
 pub enum InvalidMonomorphization<'tcx> {
-    #[diag(codegen_ssa_invalid_monomorphization_basic_integer_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_basic_integer_type, code = E0511)]
     BasicIntegerType {
         #[primary_span]
         span: Span,
@@ -620,7 +629,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_basic_float_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_basic_float_type, code = E0511)]
     BasicFloatType {
         #[primary_span]
         span: Span,
@@ -628,14 +637,14 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_float_to_int_unchecked, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_float_to_int_unchecked, code = E0511)]
     FloatToIntUnchecked {
         #[primary_span]
         span: Span,
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_floating_point_vector, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_floating_point_vector, code = E0511)]
     FloatingPointVector {
         #[primary_span]
         span: Span,
@@ -644,7 +653,7 @@ pub enum InvalidMonomorphization<'tcx> {
         in_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_floating_point_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_floating_point_type, code = E0511)]
     FloatingPointType {
         #[primary_span]
         span: Span,
@@ -652,14 +661,14 @@ pub enum InvalidMonomorphization<'tcx> {
         in_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unrecognized_intrinsic, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unrecognized_intrinsic, code = E0511)]
     UnrecognizedIntrinsic {
         #[primary_span]
         span: Span,
         name: Symbol,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_argument, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_argument, code = E0511)]
     SimdArgument {
         #[primary_span]
         span: Span,
@@ -667,7 +676,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_input, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_input, code = E0511)]
     SimdInput {
         #[primary_span]
         span: Span,
@@ -675,7 +684,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_first, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_first, code = E0511)]
     SimdFirst {
         #[primary_span]
         span: Span,
@@ -683,7 +692,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_second, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_second, code = E0511)]
     SimdSecond {
         #[primary_span]
         span: Span,
@@ -691,7 +700,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_third, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_third, code = E0511)]
     SimdThird {
         #[primary_span]
         span: Span,
@@ -699,7 +708,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_return, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_return, code = E0511)]
     SimdReturn {
         #[primary_span]
         span: Span,
@@ -707,7 +716,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_invalid_bitmask, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_invalid_bitmask, code = E0511)]
     InvalidBitmask {
         #[primary_span]
         span: Span,
@@ -717,7 +726,7 @@ pub enum InvalidMonomorphization<'tcx> {
         expected_bytes: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_length_input_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_length_input_type, code = E0511)]
     ReturnLengthInputType {
         #[primary_span]
         span: Span,
@@ -728,7 +737,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_second_argument_length, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_second_argument_length, code = E0511)]
     SecondArgumentLength {
         #[primary_span]
         span: Span,
@@ -739,7 +748,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_third_argument_length, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_third_argument_length, code = E0511)]
     ThirdArgumentLength {
         #[primary_span]
         span: Span,
@@ -750,7 +759,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_integer_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_integer_type, code = E0511)]
     ReturnIntegerType {
         #[primary_span]
         span: Span,
@@ -759,7 +768,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_simd_shuffle, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_simd_shuffle, code = E0511)]
     SimdShuffle {
         #[primary_span]
         span: Span,
@@ -767,7 +776,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_length, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_length, code = E0511)]
     ReturnLength {
         #[primary_span]
         span: Span,
@@ -777,7 +786,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_element, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_element, code = E0511)]
     ReturnElement {
         #[primary_span]
         span: Span,
@@ -788,7 +797,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_shuffle_index_not_constant, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_shuffle_index_not_constant, code = E0511)]
     ShuffleIndexNotConstant {
         #[primary_span]
         span: Span,
@@ -796,7 +805,7 @@ pub enum InvalidMonomorphization<'tcx> {
         arg_idx: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_shuffle_index_out_of_bounds, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_shuffle_index_out_of_bounds, code = E0511)]
     ShuffleIndexOutOfBounds {
         #[primary_span]
         span: Span,
@@ -805,7 +814,7 @@ pub enum InvalidMonomorphization<'tcx> {
         total_len: u128,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_inserted_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_inserted_type, code = E0511)]
     InsertedType {
         #[primary_span]
         span: Span,
@@ -815,7 +824,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_return_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_return_type, code = E0511)]
     ReturnType {
         #[primary_span]
         span: Span,
@@ -825,7 +834,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ret_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_return_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_return_type, code = E0511)]
     ExpectedReturnType {
         #[primary_span]
         span: Span,
@@ -834,7 +843,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ret_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_mismatched_lengths, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_mismatched_lengths, code = E0511)]
     MismatchedLengths {
         #[primary_span]
         span: Span,
@@ -843,7 +852,7 @@ pub enum InvalidMonomorphization<'tcx> {
         v_len: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_mask_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_mask_type, code = E0511)]
     MaskType {
         #[primary_span]
         span: Span,
@@ -851,7 +860,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_vector_argument, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_vector_argument, code = E0511)]
     VectorArgument {
         #[primary_span]
         span: Span,
@@ -860,7 +869,7 @@ pub enum InvalidMonomorphization<'tcx> {
         in_elem: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_cannot_return, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_cannot_return, code = E0511)]
     CannotReturn {
         #[primary_span]
         span: Span,
@@ -870,7 +879,7 @@ pub enum InvalidMonomorphization<'tcx> {
         expected_bytes: u64,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_element_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_element_type, code = E0511)]
     ExpectedElementType {
         #[primary_span]
         span: Span,
@@ -882,7 +891,7 @@ pub enum InvalidMonomorphization<'tcx> {
         mutability: ExpectedPointerMutability,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_third_arg_element_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_third_arg_element_type, code = E0511)]
     ThirdArgElementType {
         #[primary_span]
         span: Span,
@@ -891,7 +900,7 @@ pub enum InvalidMonomorphization<'tcx> {
         third_arg: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol_of_size, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol_of_size, code = E0511)]
     UnsupportedSymbolOfSize {
         #[primary_span]
         span: Span,
@@ -903,7 +912,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ret_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_symbol, code = E0511)]
     UnsupportedSymbol {
         #[primary_span]
         span: Span,
@@ -914,7 +923,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ret_ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_cast_fat_pointer, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_cast_fat_pointer, code = E0511)]
     CastFatPointer {
         #[primary_span]
         span: Span,
@@ -922,7 +931,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_pointer, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_pointer, code = E0511)]
     ExpectedPointer {
         #[primary_span]
         span: Span,
@@ -930,7 +939,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_usize, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_usize, code = E0511)]
     ExpectedUsize {
         #[primary_span]
         span: Span,
@@ -938,7 +947,7 @@ pub enum InvalidMonomorphization<'tcx> {
         ty: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unsupported_cast, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_cast, code = E0511)]
     UnsupportedCast {
         #[primary_span]
         span: Span,
@@ -949,7 +958,7 @@ pub enum InvalidMonomorphization<'tcx> {
         out_elem: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_unsupported_operation, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_unsupported_operation, code = E0511)]
     UnsupportedOperation {
         #[primary_span]
         span: Span,
@@ -958,7 +967,7 @@ pub enum InvalidMonomorphization<'tcx> {
         in_elem: Ty<'tcx>,
     },
 
-    #[diag(codegen_ssa_invalid_monomorphization_expected_vector_element_type, code = "E0511")]
+    #[diag(codegen_ssa_invalid_monomorphization_expected_vector_element_type, code = E0511)]
     ExpectedVectorElementType {
         #[primary_span]
         span: Span,
@@ -974,7 +983,7 @@ pub enum ExpectedPointerMutability {
 }
 
 impl IntoDiagnosticArg for ExpectedPointerMutability {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
         match self {
             ExpectedPointerMutability::Mut => DiagnosticArgValue::Str(Cow::Borrowed("*mut")),
             ExpectedPointerMutability::Not => DiagnosticArgValue::Str(Cow::Borrowed("*_")),

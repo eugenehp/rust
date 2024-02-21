@@ -45,7 +45,7 @@ function setMobileTopbar() {
         const mobileTitle = document.createElement("h2");
         mobileTitle.className = "location";
         if (hasClass(document.querySelector(".rustdoc"), "crate")) {
-            mobileTitle.innerText = `Crate ${window.currentCrate}`;
+            mobileTitle.innerHTML = `Crate <a href="#">${window.currentCrate}</a>`;
         } else if (locationTitle) {
             mobileTitle.innerHTML = locationTitle.innerHTML;
         }
@@ -1721,6 +1721,7 @@ href="https://doc.rust-lang.org/${channel}/rustdoc/read-documentation/search.htm
             }
             currentPointerId = e.pointerId;
         }
+        window.hideAllModals(false);
         e.preventDefault();
         window.addEventListener("pointermove", resize, false);
         window.addEventListener("pointercancel", stopResize, false);

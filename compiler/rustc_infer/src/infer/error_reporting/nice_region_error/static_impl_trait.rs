@@ -9,7 +9,7 @@ use crate::infer::lexical_region_resolve::RegionResolutionError;
 use crate::infer::{SubregionOrigin, TypeTrace};
 use crate::traits::{ObligationCauseCode, UnifyReceiverContext};
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_errors::{AddToDiagnostic, Applicability, Diagnostic, ErrorGuaranteed, MultiSpan};
+use rustc_errors::{AddToDiagnostic, Applicability, DiagnosticBuilder, ErrorGuaranteed, MultiSpan};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{walk_ty, Visitor};
 use rustc_hir::{
@@ -261,7 +261,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
 
 pub fn suggest_new_region_bound(
     tcx: TyCtxt<'_>,
-    err: &mut Diagnostic,
+    err: &mut DiagnosticBuilder<'_>,
     fn_returns: Vec<&rustc_hir::Ty<'_>>,
     lifetime_name: String,
     arg: Option<String>,
@@ -443,7 +443,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
                 if let hir::OwnerNode::Item(Item {
                     kind: ItemKind::Impl(hir::Impl { self_ty, .. }),
                     ..
-                }) = tcx.hir().owner(impl_did)
+                }) = tcx.hir_owner_node(impl_did)
                 {
                     Some((impl_item.ident, self_ty))
                 } else {
@@ -488,7 +488,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
     /// `'static` obligation. Suggest relaxing that implicit bound.
     fn find_impl_on_dyn_trait(
         &self,
-        err: &mut Diagnostic,
+        err: &mut DiagnosticBuilder<'_>,
         ty: Ty<'_>,
         ctxt: &UnifyReceiverContext<'tcx>,
     ) -> bool {
@@ -521,7 +521,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
 
     fn suggest_constrain_dyn_trait_in_impl(
         &self,
-        err: &mut Diagnostic,
+        err: &mut DiagnosticBuilder<'_>,
         found_dids: &FxIndexSet<DefId>,
         ident: Ident,
         self_ty: &hir::Ty<'_>,

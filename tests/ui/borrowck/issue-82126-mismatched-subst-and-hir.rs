@@ -1,7 +1,7 @@
 // Regression test for #82126. Checks that mismatched lifetimes and types are
 // properly handled.
 
-// edition:2018
+//@ edition:2018
 
 use std::sync::Mutex;
 
@@ -17,7 +17,6 @@ async fn buy_lock(coroutine: &Mutex<MarketMultiplier>) -> LockedMarket<'_> {
     //~^ ERROR struct takes 0 lifetime arguments but 1 lifetime argument was supplied
     //~^^ ERROR struct takes 1 generic argument but 0 generic arguments were supplied
     LockedMarket(coroutine.lock().unwrap().buy())
-    //~^ ERROR: cannot return value referencing temporary value
 }
 
 struct LockedMarket<T>(T);

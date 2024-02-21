@@ -142,7 +142,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
             let param_ty = return_if_err!(self.mc.pat_ty_adjusted(param.pat));
             debug!("consume_body: param_ty = {:?}", param_ty);
 
-            let param_place = self.mc.cat_rvalue(param.hir_id, param.pat.span, param_ty);
+            let param_place = self.mc.cat_rvalue(param.hir_id, param_ty);
 
             self.walk_irrefutable_pat(&param_place, param.pat);
         }
@@ -458,11 +458,15 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                             needs_to_be_read = true;
                         }
                     }
-                    PatKind::Or(_) | PatKind::Box(_) | PatKind::Ref(..) | PatKind::Wild => {
+                    PatKind::Or(_)
+                    | PatKind::Box(_)
+                    | PatKind::Ref(..)
+                    | PatKind::Wild
+                    | PatKind::Err(_) => {
                         // If the PatKind is Or, Box, or Ref, the decision is made later
                         // as these patterns contains subpatterns
-                        // If the PatKind is Wild, the decision is made based on the other patterns being
-                        // examined
+                        // If the PatKind is Wild or Err, the decision is made based on the other patterns
+                        // being examined
                     }
                 }
             })?

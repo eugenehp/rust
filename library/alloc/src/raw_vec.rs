@@ -2,7 +2,7 @@
 
 use core::alloc::LayoutError;
 use core::cmp;
-use core::intrinsics;
+use core::hint;
 use core::mem::{self, ManuallyDrop, MaybeUninit, SizedTypeProperties};
 use core::ptr::{self, NonNull, Unique};
 use core::slice;
@@ -207,11 +207,7 @@ impl<T, A: Allocator> RawVec<T, A> {
             // Allocators currently return a `NonNull<[u8]>` whose length
             // matches the size requested. If that ever changes, the capacity
             // here should change to `ptr.len() / mem::size_of::<T>()`.
-            Self {
-                ptr: unsafe { Unique::new_unchecked(ptr.cast().as_ptr()) },
-                cap: unsafe { Cap(capacity) },
-                alloc,
-            }
+            Self { ptr: Unique::from(ptr.cast()), cap: unsafe { Cap(capacity) }, alloc }
         }
     }
 
@@ -239,6 +235,11 @@ impl<T, A: Allocator> RawVec<T, A> {
         self.ptr.as_ptr()
     }
 
+    #[inline]
+    pub fn non_null(&self) -> NonNull<T> {
+        NonNull::from(self.ptr)
+    }
+
     /// Gets the capacity of the allocation.
     ///
     /// This will always be `usize::MAX` if `T` is zero-sized.
@@ -260,7 +261,7 @@ impl<T, A: Allocator> RawVec<T, A> {
             // and could hypothetically handle differences between stride and size, but this memory
             // has already been allocated so we know it can't overflow and currently rust does not
             // support such types. So we can do better by skipping some checks and avoid an unwrap.
-            let _: () = const { assert!(mem::size_of::<T>() % mem::align_of::<T>() == 0) };
+            const { assert!(mem::size_of::<T>() % mem::align_of::<T>() == 0) };
             unsafe {
                 let align = mem::align_of::<T>();
                 let size = mem::size_of::<T>().unchecked_mul(self.cap.0);
@@ -325,7 +326,7 @@ impl<T, A: Allocator> RawVec<T, A> {
         }
         unsafe {
             // Inform the optimizer that the reservation has succeeded or wasn't needed
-            core::intrinsics::assume(!self.needs_to_grow(len, additional));
+            hint::assert_unchecked(!self.needs_to_grow(len, additional));
         }
         Ok(())
     }
@@ -363,7 +364,7 @@ impl<T, A: Allocator> RawVec<T, A> {
         }
         unsafe {
             // Inform the optimizer that the reservation has succeeded or wasn't needed
-            core::intrinsics::assume(!self.needs_to_grow(len, additional));
+            hint::assert_unchecked(!self.needs_to_grow(len, additional));
         }
         Ok(())
     }
@@ -398,7 +399,7 @@ impl<T, A: Allocator> RawVec<T, A> {
         // Allocators currently return a `NonNull<[u8]>` whose length matches
         // the size requested. If that ever changes, the capacity here should
         // change to `ptr.len() / mem::size_of::<T>()`.
-        self.ptr = unsafe { Unique::new_unchecked(ptr.cast().as_ptr()) };
+        self.ptr = Unique::from(ptr.cast());
         self.cap = unsafe { Cap(cap) };
     }
 
@@ -464,7 +465,7 @@ impl<T, A: Allocator> RawVec<T, A> {
 
         let (ptr, layout) = if let Some(mem) = self.current_memory() { mem } else { return Ok(()) };
         // See current_memory() why this assert is here
-        let _: () = const { assert!(mem::size_of::<T>() % mem::align_of::<T>() == 0) };
+        const { assert!(mem::size_of::<T>() % mem::align_of::<T>() == 0) };
 
         // If shrinking to 0, deallocate the buffer. We don't reach this point
         // for the T::IS_ZST case since current_memory() will have returned
@@ -514,7 +515,7 @@ where
         debug_assert_eq!(old_layout.align(), new_layout.align());
         unsafe {
             // The allocator checks for alignment equality
-            intrinsics::assume(old_layout.align() == new_layout.align());
+            hint::assert_unchecked(old_layout.align() == new_layout.align());
             alloc.grow(ptr, old_layout, new_layout)
         }
     } else {

@@ -1,11 +1,12 @@
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
 #![feature(try_blocks)]
 #![feature(never_type)]
 #![feature(box_patterns)]
-#![feature(min_specialization)]
+#![cfg_attr(bootstrap, feature(min_specialization))]
 #![feature(control_flow_enum)]
-#![recursion_limit = "256"]
 
 #[macro_use]
 extern crate tracing;
@@ -49,10 +50,10 @@ use crate::check::check_fn;
 use crate::coercion::DynamicCoerceMany;
 use crate::diverges::Diverges;
 use crate::expectation::Expectation;
-use crate::fn_ctxt::RawTy;
+use crate::fn_ctxt::LoweredTy;
 use crate::gather_locals::GatherLocalsVisitor;
 use rustc_data_structures::unord::UnordSet;
-use rustc_errors::{struct_span_code_err, DiagnosticId, ErrorGuaranteed};
+use rustc_errors::{codes::*, struct_span_code_err, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::Visitor;
@@ -60,6 +61,7 @@ use rustc_hir::{HirIdMap, Node};
 use rustc_hir_analysis::astconv::AstConv;
 use rustc_hir_analysis::check::check_abi;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
+use rustc_infer::traits::ObligationInspector;
 use rustc_middle::query::Providers;
 use rustc_middle::traits;
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -71,7 +73,7 @@ rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 #[macro_export]
 macro_rules! type_error_struct {
-    ($dcx:expr, $span:expr, $typ:expr, $code:ident, $($message:tt)*) => ({
+    ($dcx:expr, $span:expr, $typ:expr, $code:expr, $($message:tt)*) => ({
         let mut err = rustc_errors::struct_span_code_err!($dcx, $span, $code, $($message)*);
 
         if $typ.references_error() {
@@ -139,7 +141,7 @@ fn used_trait_imports(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &UnordSet<LocalDef
 
 fn typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tcx> {
     let fallback = move || tcx.type_of(def_id.to_def_id()).instantiate_identity();
-    typeck_with_fallback(tcx, def_id, fallback)
+    typeck_with_fallback(tcx, def_id, fallback, None)
 }
 
 /// Used only to get `TypeckResults` for type inference during error recovery.
@@ -149,14 +151,28 @@ fn diagnostic_only_typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::T
         let span = tcx.hir().span(tcx.local_def_id_to_hir_id(def_id));
         Ty::new_error_with_message(tcx, span, "diagnostic only typeck table used")
     };
-    typeck_with_fallback(tcx, def_id, fallback)
+    typeck_with_fallback(tcx, def_id, fallback, None)
 }
 
-#[instrument(level = "debug", skip(tcx, fallback), ret)]
+/// Same as `typeck` but `inspect` is invoked on evaluation of each root obligation.
+/// Inspecting obligations only works with the new trait solver.
+/// This function is *only to be used* by external tools, it should not be
+/// called from within rustc. Note, this is not a query, and thus is not cached.
+pub fn inspect_typeck<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    inspect: ObligationInspector<'tcx>,
+) -> &'tcx ty::TypeckResults<'tcx> {
+    let fallback = move || tcx.type_of(def_id.to_def_id()).instantiate_identity();
+    typeck_with_fallback(tcx, def_id, fallback, Some(inspect))
+}
+
+#[instrument(level = "debug", skip(tcx, fallback, inspector), ret)]
 fn typeck_with_fallback<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     fallback: impl Fn() -> Ty<'tcx> + 'tcx,
+    inspector: Option<ObligationInspector<'tcx>>,
 ) -> &'tcx ty::TypeckResults<'tcx> {
     // Closures' typeck results come from their outermost function,
     // as they are part of the same "inference environment".
@@ -178,6 +194,9 @@ fn typeck_with_fallback<'tcx>(
     let param_env = tcx.param_env(def_id);
 
     let inh = Inherited::new(tcx, def_id);
+    if let Some(inspector) = inspector {
+        inh.infcx.attach_obligation_inspector(inspector);
+    }
     let mut fcx = FnCtxt::new(&inh, param_env, def_id);
 
     if let Some(hir::FnSig { header, decl, .. }) = fn_sig {
@@ -201,7 +220,7 @@ fn typeck_with_fallback<'tcx>(
                 span,
             }))
         } else if let Node::AnonConst(_) = node {
-            match tcx.hir_node(tcx.hir().parent_id(id)) {
+            match tcx.parent_hir_node(id) {
                 Node::Ty(&hir::Ty { kind: hir::TyKind::Typeof(ref anon_const), .. })
                     if anon_const.hir_id == id =>
                 {
@@ -269,7 +288,7 @@ fn typeck_with_fallback<'tcx>(
     debug!(pending_obligations = ?fcx.fulfillment_cx.borrow().pending_obligations());
 
     // This must be the last thing before `report_ambiguity_errors`.
-    fcx.resolve_coroutine_interiors(def_id.to_def_id());
+    fcx.resolve_coroutine_interiors();
 
     debug!(pending_obligations = ?fcx.fulfillment_cx.borrow().pending_obligations());
 
@@ -284,6 +303,10 @@ fn typeck_with_fallback<'tcx>(
     fcx.check_asms();
 
     let typeck_results = fcx.resolve_type_vars_in_body(body);
+
+    // We clone the defined opaque types during writeback in the new solver
+    // because we have to use them during normalization.
+    let _ = fcx.infcx.take_opaque_types();
 
     // Consistency check our TypeckResults instance can hold all ItemLocalIds
     // it will need to hold.
@@ -358,7 +381,7 @@ fn report_unexpected_variant_res(
     res: Res,
     qpath: &hir::QPath<'_>,
     span: Span,
-    err_code: &str,
+    err_code: ErrCode,
     expected: &str,
 ) -> ErrorGuaranteed {
     let res_descr = match res {
@@ -369,9 +392,9 @@ fn report_unexpected_variant_res(
     let err = tcx
         .dcx()
         .struct_span_err(span, format!("expected {expected}, found {res_descr} `{path_str}`"))
-        .with_code(DiagnosticId::Error(err_code.into()));
+        .with_code(err_code);
     match res {
-        Res::Def(DefKind::Fn | DefKind::AssocFn, _) if err_code == "E0164" => {
+        Res::Def(DefKind::Fn | DefKind::AssocFn, _) if err_code == E0164 => {
             let patterns_url = "https://doc.rust-lang.org/book/ch18-00-patterns.html";
             err.with_span_label(span, "`fn` calls are not allowed in patterns")
                 .with_help(format!("for more information, visit {patterns_url}"))
@@ -425,15 +448,6 @@ fn fatally_break_rust(tcx: TyCtxt<'_>, span: Span) -> ! {
         }
     }
     diag.emit()
-}
-
-/// `expected` here is the expected number of explicit generic arguments on the trait.
-fn has_expected_num_generic_args(tcx: TyCtxt<'_>, trait_did: DefId, expected: usize) -> bool {
-    let generics = tcx.generics_of(trait_did);
-    generics.count()
-        == expected
-            + if generics.has_self { 1 } else { 0 }
-            + if generics.host_effect_index.is_some() { 1 } else { 0 }
 }
 
 pub fn provide(providers: &mut Providers) {

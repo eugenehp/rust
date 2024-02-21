@@ -63,7 +63,7 @@ mod imp {
         unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), libc::GRND_NONBLOCK) }
     }
 
-    #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "freebsd"))]
+    #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "freebsd", netbsd10))]
     fn getrandom(buf: &mut [u8]) -> libc::ssize_t {
         unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) }
     }
@@ -73,7 +73,8 @@ mod imp {
         target_os = "android",
         target_os = "espidf",
         target_os = "horizon",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        netbsd10
     )))]
     fn getrandom_fill_bytes(_buf: &mut [u8]) -> bool {
         false
@@ -84,7 +85,8 @@ mod imp {
         target_os = "android",
         target_os = "espidf",
         target_os = "horizon",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        netbsd10
     ))]
     fn getrandom_fill_bytes(v: &mut [u8]) -> bool {
         use crate::sync::atomic::{AtomicBool, Ordering};
@@ -107,7 +109,18 @@ mod imp {
                     // supported on the current kernel.
                     //
                     // Also fall back in case it is disabled by something like
-                    // seccomp or inside of virtual machines.
+                    // seccomp or inside of docker.
+                    //
+                    // If the `getrandom` syscall is not implemented in the current kernel version it should return an
+                    // `ENOSYS` error. Docker also blocks the whole syscall inside unprivileged containers, and
+                    // returns `EPERM` (instead of `ENOSYS`) when a program tries to invoke the syscall. Because of
+                    // that we need to check for *both* `ENOSYS` and `EPERM`.
+                    //
+                    // Note that Docker's behavior is breaking other projects (notably glibc), so they're planning
+                    // to update their filtering to return `ENOSYS` in a future release:
+                    //
+                    //     https://github.com/moby/moby/issues/42680
+                    //
                     GETRANDOM_UNAVAILABLE.store(true, Ordering::Relaxed);
                     return false;
                 } else if err == libc::EAGAIN {
@@ -220,7 +233,7 @@ mod imp {
 }
 
 // FIXME: once the 10.x release becomes the minimum, this can be dropped for simplification.
-#[cfg(target_os = "netbsd")]
+#[cfg(all(target_os = "netbsd", not(netbsd10)))]
 mod imp {
     use crate::ptr;
 

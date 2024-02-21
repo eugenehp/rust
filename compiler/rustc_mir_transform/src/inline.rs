@@ -2,6 +2,7 @@
 use crate::deref_separator::deref_finder;
 use rustc_attr::InlineAttr;
 use rustc_const_eval::transform::validate::validate_types;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::bit_set::BitSet;
 use rustc_index::Idx;
@@ -11,6 +12,7 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{self, Instance, InstanceDef, ParamEnv, Ty, TyCtxt};
 use rustc_session::config::OptLevel;
+use rustc_span::source_map::Spanned;
 use rustc_target::abi::FieldIdx;
 use rustc_target::spec::abi::Abi;
 
@@ -172,7 +174,7 @@ impl<'tcx> Inliner<'tcx> {
         let TerminatorKind::Call { args, destination, .. } = &terminator.kind else { bug!() };
         let destination_ty = destination.ty(&caller_body.local_decls, self.tcx).ty;
         for arg in args {
-            if !arg.ty(&caller_body.local_decls, self.tcx).is_sized(self.tcx, self.param_env) {
+            if !arg.node.ty(&caller_body.local_decls, self.tcx).is_sized(self.tcx, self.param_env) {
                 // We do not allow inlining functions with unsized params. Inlining these functions
                 // could create unsized locals, which are unsound and being phased out.
                 return Err("Call has unsized argument");
@@ -238,9 +240,9 @@ impl<'tcx> Inliner<'tcx> {
             };
 
             let self_arg_ty =
-                self_arg.map(|self_arg| self_arg.ty(&caller_body.local_decls, self.tcx));
+                self_arg.map(|self_arg| self_arg.node.ty(&caller_body.local_decls, self.tcx));
 
-            let arg_tuple_ty = arg_tuple.ty(&caller_body.local_decls, self.tcx);
+            let arg_tuple_ty = arg_tuple.node.ty(&caller_body.local_decls, self.tcx);
             let ty::Tuple(arg_tuple_tys) = *arg_tuple_ty.kind() else {
                 bug!("Closure arguments are not passed as a tuple");
             };
@@ -263,7 +265,7 @@ impl<'tcx> Inliner<'tcx> {
         } else {
             for (arg, input) in args.iter().zip(callee_body.args_iter()) {
                 let input_type = callee_body.local_decls[input].ty;
-                let arg_ty = arg.ty(&caller_body.local_decls, self.tcx);
+                let arg_ty = arg.node.ty(&caller_body.local_decls, self.tcx);
                 if !util::relate_types(
                     self.tcx,
                     self.param_env,
@@ -316,6 +318,8 @@ impl<'tcx> Inliner<'tcx> {
             | InstanceDef::ReifyShim(_)
             | InstanceDef::FnPtrShim(..)
             | InstanceDef::ClosureOnceShim { .. }
+            | InstanceDef::ConstructCoroutineInClosureShim { .. }
+            | InstanceDef::CoroutineKindShim { .. }
             | InstanceDef::DropGlue(..)
             | InstanceDef::CloneShim(..)
             | InstanceDef::ThreadLocalShim(..)
@@ -381,6 +385,17 @@ impl<'tcx> Inliner<'tcx> {
                 }
 
                 let fn_sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args);
+
+                // Additionally, check that the body that we're inlining actually agrees
+                // with the ABI of the trait that the item comes from.
+                if let InstanceDef::Item(instance_def_id) = callee.def
+                    && self.tcx.def_kind(instance_def_id) == DefKind::AssocFn
+                    && let instance_fn_sig = self.tcx.fn_sig(instance_def_id).skip_binder()
+                    && instance_fn_sig.abi() != fn_sig.abi()
+                {
+                    return None;
+                }
+
                 let source_info = SourceInfo { span: fn_span, ..terminator.source_info };
 
                 return Some(CallSite { callee, fn_sig, block: bb, source_info });
@@ -694,7 +709,7 @@ impl<'tcx> Inliner<'tcx> {
 
     fn make_call_args(
         &self,
-        args: Vec<Operand<'tcx>>,
+        args: Vec<Spanned<Operand<'tcx>>>,
         callsite: &CallSite<'tcx>,
         caller_body: &mut Body<'tcx>,
         callee_body: &Body<'tcx>,
@@ -728,13 +743,13 @@ impl<'tcx> Inliner<'tcx> {
         if callsite.fn_sig.abi() == Abi::RustCall && callee_body.spread_arg.is_none() {
             let mut args = args.into_iter();
             let self_ = self.create_temp_if_necessary(
-                args.next().unwrap(),
+                args.next().unwrap().node,
                 callsite,
                 caller_body,
                 return_block,
             );
             let tuple = self.create_temp_if_necessary(
-                args.next().unwrap(),
+                args.next().unwrap().node,
                 callsite,
                 caller_body,
                 return_block,
@@ -761,7 +776,7 @@ impl<'tcx> Inliner<'tcx> {
             closure_ref_arg.chain(tuple_tmp_args).collect()
         } else {
             args.into_iter()
-                .map(|a| self.create_temp_if_necessary(a, callsite, caller_body, return_block))
+                .map(|a| self.create_temp_if_necessary(a.node, callsite, caller_body, return_block))
                 .collect()
         }
     }
@@ -1024,21 +1039,16 @@ fn try_instance_mir<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: InstanceDef<'tcx>,
 ) -> Result<&'tcx Body<'tcx>, &'static str> {
-    match instance {
-        ty::InstanceDef::DropGlue(_, Some(ty)) => match ty.kind() {
-            ty::Adt(def, args) => {
-                let fields = def.all_fields();
-                for field in fields {
-                    let field_ty = field.ty(tcx, args);
-                    if field_ty.has_param() && field_ty.has_projections() {
-                        return Err("cannot build drop shim for polymorphic type");
-                    }
-                }
-
-                Ok(tcx.instance_mir(instance))
+    if let ty::InstanceDef::DropGlue(_, Some(ty)) = instance
+        && let ty::Adt(def, args) = ty.kind()
+    {
+        let fields = def.all_fields();
+        for field in fields {
+            let field_ty = field.ty(tcx, args);
+            if field_ty.has_param() && field_ty.has_projections() {
+                return Err("cannot build drop shim for polymorphic type");
             }
-            _ => Ok(tcx.instance_mir(instance)),
-        },
-        _ => Ok(tcx.instance_mir(instance)),
+        }
     }
+    Ok(tcx.instance_mir(instance))
 }

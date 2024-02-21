@@ -3,11 +3,10 @@
 use std::fmt::{self, Write};
 
 use itertools::Itertools;
-use syntax::ast::HasName;
 
 use crate::{
     hir::{
-        Array, BindingAnnotation, BindingId, CaptureBy, ClosureKind, Literal, LiteralOrConst,
+        Array, BindingAnnotation, CaptureBy, ClosureKind, Literal, LiteralOrConst,
         Movability, Statement,
     },
     pretty::{print_generic_args, print_path, print_type_ref},
@@ -19,35 +18,30 @@ use super::*;
 pub(super) fn print_body_hir(db: &dyn DefDatabase, body: &Body, owner: DefWithBodyId) -> String {
     let header = match owner {
         DefWithBodyId::FunctionId(it) => {
-            let item_tree_id = it.lookup(db).id;
+            it.lookup(db).id.resolved(db, |it| format!("fn {}", it.name.display(db.upcast())))
+        }
+        DefWithBodyId::StaticId(it) => it
+            .lookup(db)
+            .id
+            .resolved(db, |it| format!("static {} = ", it.name.display(db.upcast()))),
+        DefWithBodyId::ConstId(it) => it.lookup(db).id.resolved(db, |it| {
             format!(
-                "fn {}",
-                item_tree_id.item_tree(db)[item_tree_id.value].name.display(db.upcast())
+                "const {} = ",
+                match &it.name {
+                    Some(name) => name.display(db.upcast()).to_string(),
+                    None => "_".to_owned(),
+                }
             )
-        }
-        DefWithBodyId::StaticId(it) => {
-            let item_tree_id = it.lookup(db).id;
-            format!(
-                "static {} = ",
-                item_tree_id.item_tree(db)[item_tree_id.value].name.display(db.upcast())
-            )
-        }
-        DefWithBodyId::ConstId(it) => {
-            let item_tree_id = it.lookup(db).id;
-            let name = match &item_tree_id.item_tree(db)[item_tree_id.value].name {
-                Some(name) => name.display(db.upcast()).to_string(),
-                None => "_".to_string(),
-            };
-            format!("const {name} = ")
-        }
-        DefWithBodyId::InTypeConstId(_) => format!("In type const = "),
+        }),
+        DefWithBodyId::InTypeConstId(_) => "In type const = ".to_owned(),
         DefWithBodyId::VariantId(it) => {
-            let src = it.parent.child_source(db);
-            let variant = &src.value[it.local_id];
-            match &variant.name() {
-                Some(name) => name.to_string(),
-                None => "_".to_string(),
-            }
+            let loc = it.lookup(db);
+            let enum_loc = loc.parent.lookup(db);
+            format!(
+                "enum {}::{}",
+                enum_loc.id.item_tree(db)[enum_loc.id.value].name.display(db.upcast()),
+                loc.id.item_tree(db)[loc.id.value].name.display(db.upcast()),
+            )
         }
     };
 
@@ -129,7 +123,7 @@ impl Printer<'_> {
         wln!(self);
         f(self);
         self.indent_level -= 1;
-        self.buf = self.buf.trim_end_matches('\n').to_string();
+        self.buf = self.buf.trim_end_matches('\n').to_owned();
     }
 
     fn whitespace(&mut self) {
@@ -267,6 +261,11 @@ impl Printer<'_> {
                     self.print_expr(*expr);
                 }
             }
+            Expr::Become { expr } => {
+                w!(self, "become");
+                self.whitespace();
+                self.print_expr(*expr);
+            }
             Expr::Yield { expr } => {
                 w!(self, "yield");
                 if let Some(expr) = expr {
@@ -384,7 +383,7 @@ impl Printer<'_> {
             }
             Expr::Closure { args, arg_types, ret_type, body, closure_kind, capture_by } => {
                 match closure_kind {
-                    ClosureKind::Generator(Movability::Static) => {
+                    ClosureKind::Coroutine(Movability::Static) => {
                         w!(self, "static ");
                     }
                     ClosureKind::Async => {
@@ -629,6 +628,7 @@ impl Printer<'_> {
                 }
                 wln!(self);
             }
+            Statement::Item => (),
         }
     }
 

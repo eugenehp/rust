@@ -1,6 +1,6 @@
-// edition: 2024
-// compile-flags: -Zunstable-options
-// run-pass
+//@ edition: 2024
+//@ compile-flags: -Zunstable-options
+//@ run-pass
 
 #![feature(gen_blocks, async_iterator)]
 #![feature(noop_waker)]
@@ -46,7 +46,6 @@ async fn async_main() {
 use std::pin::{Pin, pin};
 use std::task::*;
 use std::async_iter::AsyncIterator;
-use std::future::Future;
 
 trait AsyncIterExt {
     fn next(&mut self) -> Next<'_, Self>;
@@ -74,8 +73,7 @@ fn main() {
     let mut fut = pin!(async_main());
 
     // Poll loop, just to test the future...
-    let waker = Waker::noop();
-    let ctx = &mut Context::from_waker(&waker);
+    let ctx = &mut Context::from_waker(Waker::noop());
 
     loop {
         match fut.as_mut().poll(ctx) {

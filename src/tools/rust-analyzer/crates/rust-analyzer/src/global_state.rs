@@ -3,13 +3,13 @@
 //!
 //! Each tick provides an immutable snapshot of the state as `WorldSnapshot`.
 
-use std::time::Instant;
+use std::{collections::hash_map::Entry, time::Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use flycheck::FlycheckHandle;
 use hir::Change;
 use ide::{Analysis, AnalysisHost, Cancellable, FileId};
-use ide_db::base_db::{CrateId, FileLoader, ProcMacroPaths, SourceDatabase};
+use ide_db::base_db::{CrateId, ProcMacroPaths};
 use load_cargo::SourceRootConfig;
 use lsp_types::{SemanticTokens, Url};
 use nohash_hasher::IntMap;
@@ -21,7 +21,7 @@ use proc_macro_api::ProcMacroServer;
 use project_model::{CargoWorkspace, ProjectWorkspace, Target, WorkspaceBuildScripts};
 use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
-use vfs::{AnchoredPathBuf, Vfs};
+use vfs::{AnchoredPathBuf, ChangedFile, Vfs};
 
 use crate::{
     config::{Config, ConfigError},
@@ -33,7 +33,7 @@ use crate::{
     mem_docs::MemDocs,
     op_queue::OpQueue,
     reload,
-    task_pool::TaskPool,
+    task_pool::{TaskPool, TaskQueue},
 };
 
 // Enforces drop order
@@ -74,8 +74,8 @@ pub(crate) struct GlobalState {
     pub(crate) last_reported_status: Option<lsp_ext::ServerStatusParams>,
 
     // proc macros
-    pub(crate) proc_macro_changed: bool,
     pub(crate) proc_macro_clients: Arc<[anyhow::Result<ProcMacroServer>]>,
+    pub(crate) build_deps_changed: bool,
 
     // Flycheck
     pub(crate) flycheck: Arc<[FlycheckHandle]>,
@@ -126,6 +126,17 @@ pub(crate) struct GlobalState {
         OpQueue<(), (Arc<Vec<ProjectWorkspace>>, Vec<anyhow::Result<WorkspaceBuildScripts>>)>,
     pub(crate) fetch_proc_macros_queue: OpQueue<Vec<ProcMacroPaths>, bool>,
     pub(crate) prime_caches_queue: OpQueue,
+
+    /// A deferred task queue.
+    ///
+    /// This queue is used for doing database-dependent work inside of sync
+    /// handlers, as accessing the database may block latency-sensitive
+    /// interactions and should be moved away from the main thread.
+    ///
+    /// For certain features, such as [`lsp_ext::UnindexedProjectParams`],
+    /// this queue should run only *after* [`GlobalState::process_changes`] has
+    /// been called.
+    pub(crate) deferred_task_queue: TaskQueue,
 }
 
 /// An immutable snapshot of the world's state at a point in time.
@@ -165,6 +176,11 @@ impl GlobalState {
             Handle { handle, receiver }
         };
 
+        let task_queue = {
+            let (sender, receiver) = unbounded();
+            TaskQueue { sender, receiver }
+        };
+
         let mut analysis_host = AnalysisHost::new(config.lru_parse_query_capacity());
         if let Some(capacities) = config.lru_query_capacities() {
             analysis_host.update_lru_capacities(capacities);
@@ -187,8 +203,9 @@ impl GlobalState {
             source_root_config: SourceRootConfig::default(),
             config_errors: Default::default(),
 
-            proc_macro_changed: false,
             proc_macro_clients: Arc::from_iter([]),
+
+            build_deps_changed: false,
 
             flycheck: Arc::from_iter([]),
             flycheck_sender,
@@ -208,6 +225,8 @@ impl GlobalState {
             fetch_proc_macros_queue: OpQueue::default(),
 
             prime_caches_queue: OpQueue::default(),
+
+            deferred_task_queue: task_queue,
         };
         // Apply any required database inputs from the config.
         this.update_configuration(config);
@@ -215,10 +234,10 @@ impl GlobalState {
     }
 
     pub(crate) fn process_changes(&mut self) -> bool {
-        let _p = profile::span("GlobalState::process_changes");
+        let _p = tracing::span!(tracing::Level::INFO, "GlobalState::process_changes").entered();
 
-        let mut file_changes = FxHashMap::default();
-        let (change, changed_files, workspace_structure_change) = {
+        let mut file_changes = FxHashMap::<_, (bool, ChangedFile)>::default();
+        let (change, modified_rust_files, workspace_structure_change) = {
             let mut change = Change::new();
             let mut guard = self.vfs.write();
             let changed_files = guard.0.take_changes();
@@ -233,64 +252,70 @@ impl GlobalState {
             // id that is followed by a delete we actually skip observing the file text from the
             // earlier event, to avoid problems later on.
             for changed_file in changed_files {
-                use vfs::ChangeKind::*;
-
-                file_changes
-                    .entry(changed_file.file_id)
-                    .and_modify(|(change, just_created)| {
-                        // None -> Delete => keep
-                        // Create -> Delete => collapse
-                        //
-                        match (change, just_created, changed_file.change_kind) {
+                use vfs::Change::*;
+                match file_changes.entry(changed_file.file_id) {
+                    Entry::Occupied(mut o) => {
+                        let (just_created, change) = o.get_mut();
+                        match (&mut change.change, just_created, changed_file.change) {
                             // latter `Delete` wins
                             (change, _, Delete) => *change = Delete,
                             // merge `Create` with `Create` or `Modify`
-                            (Create, _, Create | Modify) => {}
+                            (Create(prev), _, Create(new) | Modify(new)) => *prev = new,
                             // collapse identical `Modify`es
-                            (Modify, _, Modify) => {}
+                            (Modify(prev), _, Modify(new)) => *prev = new,
                             // equivalent to `Modify`
-                            (change @ Delete, just_created, Create) => {
-                                *change = Modify;
+                            (change @ Delete, just_created, Create(new)) => {
+                                *change = Modify(new);
                                 *just_created = true;
                             }
                             // shouldn't occur, but collapse into `Create`
-                            (change @ Delete, just_created, Modify) => {
-                                *change = Create;
+                            (change @ Delete, just_created, Modify(new)) => {
+                                *change = Create(new);
                                 *just_created = true;
                             }
-                            // shouldn't occur, but collapse into `Modify`
-                            (Modify, _, Create) => {}
+                            // shouldn't occur, but keep the Create
+                            (prev @ Modify(_), _, new @ Create(_)) => *prev = new,
                         }
-                    })
-                    .or_insert((
-                        changed_file.change_kind,
-                        matches!(changed_file.change_kind, Create),
-                    ));
+                    }
+                    Entry::Vacant(v) => {
+                        _ = v.insert((matches!(&changed_file.change, Create(_)), changed_file))
+                    }
+                }
             }
 
             let changed_files: Vec<_> = file_changes
                 .into_iter()
-                .filter(|(_, (change_kind, just_created))| {
-                    !matches!((change_kind, just_created), (vfs::ChangeKind::Delete, true))
+                .filter(|(_, (just_created, change))| {
+                    !(*just_created && matches!(change.change, vfs::Change::Delete))
                 })
-                .map(|(file_id, (change_kind, _))| vfs::ChangedFile { file_id, change_kind })
+                .map(|(file_id, (_, change))| vfs::ChangedFile { file_id, ..change })
                 .collect();
 
             let mut workspace_structure_change = None;
             // A file was added or deleted
             let mut has_structure_changes = false;
             let mut bytes = vec![];
-            for file in &changed_files {
+            let mut modified_rust_files = vec![];
+            for file in changed_files {
                 let vfs_path = &vfs.file_path(file.file_id);
                 if let Some(path) = vfs_path.as_path() {
                     let path = path.to_path_buf();
-                    if reload::should_refresh_for_change(&path, file.change_kind) {
-                        workspace_structure_change = Some((path.clone(), false));
+                    if reload::should_refresh_for_change(&path, file.kind()) {
+                        workspace_structure_change = Some((
+                            path.clone(),
+                            false,
+                            AsRef::<std::path::Path>::as_ref(&path).ends_with("build.rs"),
+                        ));
                     }
                     if file.is_created_or_deleted() {
                         has_structure_changes = true;
-                        workspace_structure_change =
-                            Some((path, self.crate_graph_file_dependencies.contains(vfs_path)));
+                        workspace_structure_change = Some((
+                            path,
+                            self.crate_graph_file_dependencies.contains(vfs_path),
+                            false,
+                        ));
+                    } else if path.extension() == Some("rs".as_ref()) {
+                        modified_rust_files.push(file.file_id);
                     }
                 }
 
@@ -299,14 +324,12 @@ impl GlobalState {
                     self.diagnostics.clear_native_for(file.file_id);
                 }
 
-                let text = if file.exists() {
-                    let bytes = vfs.file_contents(file.file_id).to_vec();
-
-                    String::from_utf8(bytes).ok().and_then(|text| {
+                let text = if let vfs::Change::Create(v) | vfs::Change::Modify(v) = file.change {
+                    String::from_utf8(v).ok().map(|text| {
                         // FIXME: Consider doing normalization in the `vfs` instead? That allows
                         // getting rid of some locking
                         let (text, line_endings) = LineEndings::normalize(text);
-                        Some((Arc::from(text), line_endings))
+                        (Arc::from(text), line_endings)
                     })
                 } else {
                     None
@@ -327,29 +350,32 @@ impl GlobalState {
                 let roots = self.source_root_config.partition(vfs);
                 change.set_roots(roots);
             }
-            (change, changed_files, workspace_structure_change)
+            (change, modified_rust_files, workspace_structure_change)
         };
 
         self.analysis_host.apply_change(change);
 
         {
-            let raw_database = self.analysis_host.raw_database();
+            if !matches!(&workspace_structure_change, Some((.., true))) {
+                _ = self
+                    .deferred_task_queue
+                    .sender
+                    .send(crate::main_loop::QueuedTask::CheckProcMacroSources(modified_rust_files));
+            }
             // FIXME: ideally we should only trigger a workspace fetch for non-library changes
             // but something's going wrong with the source root business when we add a new local
             // crate see https://github.com/rust-lang/rust-analyzer/issues/13029
-            if let Some((path, force_crate_graph_reload)) = workspace_structure_change {
+            if let Some((path, force_crate_graph_reload, build_scripts_touched)) =
+                workspace_structure_change
+            {
                 self.fetch_workspaces_queue.request_op(
                     format!("workspace vfs file change: {path}"),
                     force_crate_graph_reload,
                 );
+                if build_scripts_touched {
+                    self.fetch_build_data_queue.request_op(format!("build.rs changed: {path}"), ());
+                }
             }
-            self.proc_macro_changed =
-                changed_files.iter().filter(|file| !file.is_created_or_deleted()).any(|file| {
-                    let crates = raw_database.relevant_crates(file.file_id);
-                    let crate_graph = raw_database.crate_graph();
-
-                    crates.iter().any(|&krate| crate_graph[krate].is_proc_macro)
-                });
         }
 
         true
@@ -375,7 +401,7 @@ impl GlobalState {
         params: R::Params,
         handler: ReqHandler,
     ) {
-        let request = self.req_queue.outgoing.register(R::METHOD.to_string(), params, handler);
+        let request = self.req_queue.outgoing.register(R::METHOD.to_owned(), params, handler);
         self.send(request.into());
     }
 
@@ -392,7 +418,7 @@ impl GlobalState {
         &self,
         params: N::Params,
     ) {
-        let not = lsp_server::Notification::new(N::METHOD.to_string(), params);
+        let not = lsp_server::Notification::new(N::METHOD.to_owned(), params);
         self.send(not.into());
     }
 
@@ -492,10 +518,6 @@ impl GlobalStateSnapshot {
             ProjectWorkspace::Json { .. } => None,
             ProjectWorkspace::DetachedFiles { .. } => None,
         })
-    }
-
-    pub(crate) fn vfs_memory_usage(&self) -> usize {
-        self.vfs_read().memory_usage()
     }
 
     pub(crate) fn file_exists(&self, file_id: FileId) -> bool {

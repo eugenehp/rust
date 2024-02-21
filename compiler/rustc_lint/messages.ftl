@@ -72,8 +72,11 @@ lint_builtin_explicit_outlives = outlives requirements can be inferred
 
 lint_builtin_export_name_fn = declaration of a function with `export_name`
 lint_builtin_export_name_method = declaration of a method with `export_name`
-
 lint_builtin_export_name_static = declaration of a static with `export_name`
+
+lint_builtin_global_asm = usage of `core::arch::global_asm`
+lint_builtin_global_macro_unsafety = using this macro is unsafe even though it does not need an `unsafe` block
+
 lint_builtin_impl_unsafe_method = implementation of an `unsafe` method
 
 lint_builtin_incomplete_features = the feature `{$name}` is incomplete and may not be safe to use and/or cause compiler crashes
@@ -148,7 +151,7 @@ lint_builtin_unsafe_impl = implementation of an `unsafe` trait
 
 lint_builtin_unsafe_trait = declaration of an `unsafe` trait
 
-lint_builtin_unstable_features = unstable feature
+lint_builtin_unstable_features = use of an unstable feature
 
 lint_builtin_unused_doc_comment = unused doc comment
     .label = rustdoc does not generate documentation for {$kind}
@@ -240,7 +243,10 @@ lint_hidden_unicode_codepoints = unicode codepoint changing visible direction of
 
 lint_identifier_non_ascii_char = identifier contains non-ASCII characters
 
-lint_identifier_uncommon_codepoints = identifier contains uncommon Unicode codepoints
+lint_identifier_uncommon_codepoints = identifier contains {$codepoints_len ->
+    [one] an uncommon Unicode codepoint
+    *[other] uncommon Unicode codepoints
+}: {$codepoints}
 
 lint_ignored_unless_crate_specified = {$level}({$name}) is ignored unless specified at crate level
 
@@ -316,6 +322,11 @@ lint_invalid_nan_comparisons_lt_le_gt_ge = incorrect NaN comparison, NaN is not 
 lint_invalid_reference_casting_assign_to_ref = assigning to `&T` is undefined behavior, consider using an `UnsafeCell`
     .label = casting happend here
 
+lint_invalid_reference_casting_bigger_layout = casting references to a bigger memory layout than the backing allocation is undefined behavior, even if the reference is unused
+    .label = casting happend here
+    .alloc = backing allocation comes from here
+    .layout = casting from `{$from_ty}` ({$from_size} bytes) to `{$to_ty}` ({$to_size} bytes)
+
 lint_invalid_reference_casting_borrow_as_mut = casting `&T` to `&mut T` is undefined behavior, even if the reference is unused, consider instead using an `UnsafeCell`
     .label = casting happend here
 
@@ -344,6 +355,9 @@ lint_multiple_supertrait_upcastable = `{$ident}` is object-safe and has multiple
 
 lint_node_source = `forbid` level set here
     .note = {$reason}
+
+lint_non_binding_let_multi_drop_fn =
+    consider immediately dropping the value using `drop(..)` after the `let` statement
 
 lint_non_binding_let_multi_suggestion =
     consider immediately dropping the value

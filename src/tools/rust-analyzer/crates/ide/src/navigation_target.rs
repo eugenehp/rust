@@ -17,7 +17,7 @@ use ide_db::{
 use stdx::never;
 use syntax::{
     ast::{self, HasName},
-    AstNode, SmolStr, SyntaxNode, TextRange,
+    format_smolstr, AstNode, SmolStr, SyntaxNode, TextRange,
 };
 
 /// `NavigationTarget` represents an element in the editor's UI which you can
@@ -76,7 +76,7 @@ pub(crate) trait ToNav {
     fn to_nav(&self, db: &RootDatabase) -> UpmappingResult<NavigationTarget>;
 }
 
-pub(crate) trait TryToNav {
+pub trait TryToNav {
     fn try_to_nav(&self, db: &RootDatabase) -> Option<UpmappingResult<NavigationTarget>>;
 }
 
@@ -457,7 +457,7 @@ impl TryToNav for hir::Field {
                 |(FileRange { file_id, range: full_range }, focus_range)| {
                     NavigationTarget::from_syntax(
                         file_id,
-                        format!("{}", self.index()).into(),
+                        format_smolstr!("{}", self.index()),
                         focus_range,
                         full_range,
                         SymbolKind::Field,
@@ -689,7 +689,7 @@ impl<T> UpmappingResult<T> {
     }
 
     pub fn collect<FI: FromIterator<T>>(self) -> FI {
-        FI::from_iter(self.into_iter())
+        FI::from_iter(self)
     }
 }
 
@@ -860,7 +860,7 @@ fn foo() { enum FooInner { } }
 "#,
         );
 
-        let navs = analysis.symbol_search(Query::new("FooInner".to_string()), !0).unwrap();
+        let navs = analysis.symbol_search(Query::new("FooInner".to_owned()), !0).unwrap();
         expect![[r#"
             [
                 NavigationTarget {
@@ -898,7 +898,7 @@ struct Foo;
 "#,
         );
 
-        let navs = analysis.symbol_search(Query::new("foo".to_string()), !0).unwrap();
+        let navs = analysis.symbol_search(Query::new("foo".to_owned()), !0).unwrap();
         assert_eq!(navs.len(), 2)
     }
 }

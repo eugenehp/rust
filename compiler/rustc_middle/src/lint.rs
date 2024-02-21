@@ -2,7 +2,7 @@ use std::cmp;
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sorted_map::SortedMap;
-use rustc_errors::{Diagnostic, DiagnosticBuilder, DiagnosticId, DiagnosticMessage, MultiSpan};
+use rustc_errors::{DiagnosticBuilder, DiagnosticMessage, MultiSpan};
 use rustc_hir::{HirId, ItemLocalId};
 use rustc_session::lint::{
     builtin::{self, FORBIDDEN_LINT_GROUPS},
@@ -204,9 +204,14 @@ pub fn explain_lint_level_source(
     lint: &'static Lint,
     level: Level,
     src: LintLevelSource,
-    err: &mut Diagnostic,
+    err: &mut DiagnosticBuilder<'_, ()>,
 ) {
     let name = lint.name_lower();
+    if let Level::Allow = level {
+        // Do not point at `#[allow(compat_lint)]` as the reason for a compatibility lint
+        // triggering. (#121009)
+        return;
+    }
     match src {
         LintLevelSource::Default => {
             err.note_once(format!("`#[{}({})]` on by default", level.as_str(), name));
@@ -247,18 +252,18 @@ pub fn explain_lint_level_source(
 ///
 /// If you are looking to implement a lint, look for higher level functions,
 /// for example:
-/// - [`TyCtxt::emit_spanned_lint`]
-/// - [`TyCtxt::struct_span_lint_hir`]
-/// - [`TyCtxt::emit_lint`]
-/// - [`TyCtxt::struct_lint_node`]
-/// - `LintContext::lookup`
+/// - [`TyCtxt::emit_node_span_lint`]
+/// - [`TyCtxt::node_span_lint`]
+/// - [`TyCtxt::emit_node_lint`]
+/// - [`TyCtxt::node_lint`]
+/// - `LintContext::opt_span_lint`
 ///
 /// ## `decorate`
 ///
 /// It is not intended to call `emit`/`cancel` on the `DiagnosticBuilder` passed
 /// in the `decorate` callback.
 #[track_caller]
-pub fn struct_lint_level(
+pub fn lint_level(
     sess: &Session,
     lint: &'static Lint,
     level: Level,
@@ -270,7 +275,7 @@ pub fn struct_lint_level(
     // Avoid codegen bloat from monomorphization by immediately doing dyn dispatch of `decorate` to
     // the "real" work.
     #[track_caller]
-    fn struct_lint_level_impl(
+    fn lint_level_impl(
         sess: &Session,
         lint: &'static Lint,
         level: Level,
@@ -322,8 +327,6 @@ pub fn struct_lint_level(
             err.span(span);
         }
 
-        err.is_lint();
-
         // If this code originates in a foreign macro, aka something that this crate
         // did not itself author, then it's likely that there's nothing this crate
         // can do about it. We probably want to skip the lint entirely.
@@ -351,13 +354,12 @@ pub fn struct_lint_level(
         // suppressed the lint due to macros.
         err.primary_message(msg);
 
-        let name = lint.name_lower();
-        err.code(DiagnosticId::Lint { name, has_future_breakage });
+        err.is_lint(lint.name_lower(), has_future_breakage);
 
         // Lint diagnostics that are covered by the expect level will not be emitted outside
         // the compiler. It is therefore not necessary to add any information for the user.
         // This will therefore directly call the decorate function which will in turn emit
-        // the `Diagnostic`.
+        // the diagnostic.
         if let Level::Expect(_) = level {
             decorate(&mut err);
             err.emit();
@@ -399,10 +401,10 @@ pub fn struct_lint_level(
 
         // Finally, run `decorate`.
         decorate(&mut err);
-        explain_lint_level_source(lint, level, src, &mut *err);
+        explain_lint_level_source(lint, level, src, &mut err);
         err.emit()
     }
-    struct_lint_level_impl(sess, lint, level, src, span, msg, Box::new(decorate))
+    lint_level_impl(sess, lint, level, src, span, msg, Box::new(decorate))
 }
 
 /// Returns whether `span` originates in a foreign crate's external macro.

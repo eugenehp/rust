@@ -19,8 +19,6 @@ use crate::os::raw::c_char;
 
 pub mod alloc;
 pub mod args;
-#[path = "../unix/cmath.rs"]
-pub mod cmath;
 pub mod env;
 pub mod fd;
 pub mod fs;
@@ -30,10 +28,6 @@ pub mod io;
 pub mod memchr;
 pub mod net;
 pub mod os;
-#[path = "../unix/os_str.rs"]
-pub mod os_str;
-#[path = "../unix/path.rs"]
-pub mod path;
 #[path = "../unsupported/pipe.rs"]
 pub mod pipe;
 #[path = "../unsupported/process.rs"]
@@ -44,16 +38,6 @@ pub mod thread_local_dtor;
 #[path = "../unsupported/thread_local_key.rs"]
 pub mod thread_local_key;
 pub mod time;
-
-#[path = "../unix/locks"]
-pub mod locks {
-    mod futex_condvar;
-    mod futex_mutex;
-    mod futex_rwlock;
-    pub(crate) use futex_condvar::Condvar;
-    pub(crate) use futex_mutex::Mutex;
-    pub(crate) use futex_rwlock::RwLock;
-}
 
 use crate::io::ErrorKind;
 use crate::os::hermit::abi;

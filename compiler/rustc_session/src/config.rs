@@ -347,6 +347,7 @@ impl SwitchWithOptPath {
 pub enum SymbolManglingVersion {
     Legacy,
     V0,
+    Hashed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Hash)]
@@ -531,21 +532,6 @@ impl Default for ErrorOutputType {
     fn default() -> Self {
         Self::HumanReadable(HumanReadableErrorType::Default(ColorConfig::Auto))
     }
-}
-
-/// Parameter to control path trimming.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum TrimmedDefPaths {
-    /// `try_print_trimmed_def_path` never prints a trimmed path and never calls the expensive
-    /// query.
-    #[default]
-    Never,
-    /// `try_print_trimmed_def_path` calls the expensive query, the query doesn't call
-    /// `good_path_delayed_bug`.
-    Always,
-    /// `try_print_trimmed_def_path` calls the expensive query, the query calls
-    /// `good_path_delayed_bug`.
-    GoodPath,
 }
 
 #[derive(Clone, Hash, Debug)]
@@ -1089,7 +1075,7 @@ impl Default for Options {
             debug_assertions: true,
             actually_rustdoc: false,
             resolve_doc_links: ResolveDocLinks::None,
-            trimmed_def_paths: TrimmedDefPaths::default(),
+            trimmed_def_paths: false,
             cli_forced_codegen_units: None,
             cli_forced_local_thinlto_off: false,
             remap_path_prefix: Vec::new(),
@@ -1449,12 +1435,16 @@ impl CheckCfg {
         //
         // When adding a new config here you should also update
         // `tests/ui/check-cfg/well-known-values.rs`.
+        //
+        // Don't forget to update `src/doc/unstable-book/src/compiler-flags/check-cfg.md`
+        // in the unstable book as well!
 
         ins!(sym::debug_assertions, no_values);
 
-        // These three are never set by rustc, but we set them anyway: they
-        // should not trigger a lint because `cargo doc`, `cargo test`, and
-        // `cargo miri run` (respectively) can set them.
+        // These four are never set by rustc, but we set them anyway: they
+        // should not trigger a lint because `cargo clippy`, `cargo doc`,
+        // `cargo test` and `cargo miri run` (respectively) can set them.
+        ins!(sym::clippy, no_values);
         ins!(sym::doc, no_values);
         ins!(sym::doctest, no_values);
         ins!(sym::miri, no_values);
@@ -2478,6 +2468,9 @@ pub fn parse_externs(
             ));
             let adjusted_name = name.replace('-', "_");
             if is_ascii_ident(&adjusted_name) {
+                // FIXME: make this translatable
+                #[allow(rustc::diagnostic_outside_of_impl)]
+                #[allow(rustc::untranslatable_diagnostic)]
                 error.help(format!(
                     "consider replacing the dashes with underscores: `{adjusted_name}`"
                 ));
@@ -2707,11 +2700,19 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
     match cg.symbol_mangling_version {
         // Stable values:
         None | Some(SymbolManglingVersion::V0) => {}
+
         // Unstable values:
         Some(SymbolManglingVersion::Legacy) => {
             if !unstable_opts.unstable_options {
                 early_dcx.early_fatal(
                     "`-C symbol-mangling-version=legacy` requires `-Z unstable-options`",
+                );
+            }
+        }
+        Some(SymbolManglingVersion::Hashed) => {
+            if !unstable_opts.unstable_options {
+                early_dcx.early_fatal(
+                    "`-C symbol-mangling-version=hashed` requires `-Z unstable-options`",
                 );
             }
         }
@@ -2756,6 +2757,12 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
                 );
             }
             Some(SymbolManglingVersion::V0) => {}
+            Some(SymbolManglingVersion::Hashed) => {
+                early_dcx.early_warn(
+                    "-C instrument-coverage requires symbol mangling version `v0`, \
+                    but `-C symbol-mangling-version=hashed` was specified",
+                );
+            }
         }
     }
 
@@ -2926,7 +2933,7 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         debug_assertions,
         actually_rustdoc: false,
         resolve_doc_links: ResolveDocLinks::ExportedMetadata,
-        trimmed_def_paths: TrimmedDefPaths::default(),
+        trimmed_def_paths: false,
         cli_forced_codegen_units: codegen_units,
         cli_forced_local_thinlto_off: disable_local_thinlto,
         remap_path_prefix,
@@ -3092,7 +3099,7 @@ impl fmt::Display for CrateType {
 }
 
 impl IntoDiagnosticArg for CrateType {
-    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue {
         self.to_string().into_diagnostic_arg()
     }
 }
@@ -3205,12 +3212,12 @@ pub enum WasiExecModel {
 /// how the hash should be calculated when adding a new command-line argument.
 pub(crate) mod dep_tracking {
     use super::{
-        BranchProtection, CFGuard, CFProtection, CrateType, DebugInfo, DebugInfoCompression,
-        ErrorOutputType, FunctionReturn, InliningThreshold, InstrumentCoverage, InstrumentXRay,
-        LinkerPluginLto, LocationDetail, LtoCli, NextSolverConfig, OomStrategy, OptLevel,
-        OutFileName, OutputType, OutputTypes, Polonius, RemapPathScopeComponents, ResolveDocLinks,
-        SourceFileHashAlgorithm, SplitDwarfKind, SwitchWithOptPath, SymbolManglingVersion,
-        TrimmedDefPaths, WasiExecModel,
+        BranchProtection, CFGuard, CFProtection, CollapseMacroDebuginfo, CrateType, DebugInfo,
+        DebugInfoCompression, ErrorOutputType, FunctionReturn, InliningThreshold,
+        InstrumentCoverage, InstrumentXRay, LinkerPluginLto, LocationDetail, LtoCli,
+        NextSolverConfig, OomStrategy, OptLevel, OutFileName, OutputType, OutputTypes, Polonius,
+        RemapPathScopeComponents, ResolveDocLinks, SourceFileHashAlgorithm, SplitDwarfKind,
+        SwitchWithOptPath, SymbolManglingVersion, WasiExecModel,
     };
     use crate::lint;
     use crate::utils::NativeLib;
@@ -3226,7 +3233,7 @@ pub(crate) mod dep_tracking {
     };
     use std::collections::BTreeMap;
     use std::hash::{DefaultHasher, Hash};
-    use std::num::NonZeroUsize;
+    use std::num::NonZero;
     use std::path::PathBuf;
 
     pub trait DepTrackingHash {
@@ -3268,7 +3275,7 @@ pub(crate) mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(
         bool,
         usize,
-        NonZeroUsize,
+        NonZero<usize>,
         u64,
         Hash64,
         String,
@@ -3289,6 +3296,7 @@ pub(crate) mod dep_tracking {
         LtoCli,
         DebugInfo,
         DebugInfoCompression,
+        CollapseMacroDebuginfo,
         UnstableFeatures,
         NativeLib,
         SanitizerSet,
@@ -3305,7 +3313,6 @@ pub(crate) mod dep_tracking {
         SymbolManglingVersion,
         RemapPathScopeComponents,
         SourceFileHashAlgorithm,
-        TrimmedDefPaths,
         OutFileName,
         OutputType,
         RealFileName,
@@ -3451,6 +3458,25 @@ pub enum ProcMacroExecutionStrategy {
 
     /// Run the proc-macro code on a different thread.
     CrossThread,
+}
+
+/// How to perform collapse macros debug info
+/// if-ext - if macro from different crate (related to callsite code)
+/// | cmd \ attr    | no  | (unspecified) | external | yes |
+/// | no            | no  | no            | no       | no  |
+/// | (unspecified) | no  | no            | if-ext   | yes |
+/// | external      | no  | if-ext        | if-ext   | yes |
+/// | yes           | yes | yes           | yes      | yes |
+#[derive(Clone, Copy, PartialEq, Hash, Debug)]
+pub enum CollapseMacroDebuginfo {
+    /// Don't collapse debuginfo for the macro
+    No = 0,
+    /// Unspecified value
+    Unspecified = 1,
+    /// Collapse debuginfo if the macro comes from a different crate
+    External = 2,
+    /// Collapse debuginfo for the macro
+    Yes = 3,
 }
 
 /// Which format to use for `-Z dump-mono-stats`

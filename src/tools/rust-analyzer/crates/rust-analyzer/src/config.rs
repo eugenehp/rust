@@ -32,6 +32,7 @@ use project_model::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{de::DeserializeOwned, Deserialize};
+use stdx::format_to_acc;
 use vfs::{AbsPath, AbsPathBuf};
 
 use crate::{
@@ -111,7 +112,7 @@ config_data! {
         cargo_buildScripts_overrideCommand: Option<Vec<String>> = "null",
         /// Rerun proc-macros building/build-scripts running when proc-macro
         /// or build-script sources change and are saved.
-        cargo_buildScripts_rebuildOnSave: bool = "false",
+        cargo_buildScripts_rebuildOnSave: bool = "true",
         /// Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to
         /// avoid checking unnecessary things.
         cargo_buildScripts_useRustcWrapper: bool = "true",
@@ -135,6 +136,13 @@ config_data! {
         ///
         /// This option does not take effect until rust-analyzer is restarted.
         cargo_sysroot: Option<String>    = "\"discover\"",
+        /// Whether to run cargo metadata on the sysroot library allowing rust-analyzer to analyze
+        /// third-party dependencies of the standard libraries.
+        ///
+        /// This will cause `cargo` to create a lockfile in your sysroot directory. rust-analyzer
+        /// will attempt to clean up afterwards, but nevertheless requires the location to be
+        /// writable to.
+        cargo_sysrootQueryMetadata: bool     = "false",
         /// Relative path to the sysroot library sources. If left unset, this will default to
         /// `{cargo.sysroot}/lib/rustlib/src/rust/library`.
         ///
@@ -201,6 +209,11 @@ config_data! {
         /// by changing `#rust-analyzer.check.invocationStrategy#` and
         /// `#rust-analyzer.check.invocationLocation#`.
         ///
+        /// If `$saved_file` is part of the command, rust-analyzer will pass
+        /// the absolute path of the saved file to the provided command. This is
+        /// intended to be used with non-Cargo build systems.
+        /// Note that `$saved_file` is experimental and may be removed in the futureg.
+        ///
         /// An example command would be:
         ///
         /// ```bash
@@ -215,6 +228,9 @@ config_data! {
         ///
         /// Aliased as `"checkOnSave.targets"`.
         check_targets | checkOnSave_targets | checkOnSave_target: Option<CheckOnSaveTargets> = "null",
+        /// Whether `--workspace` should be passed to `cargo check`.
+        /// If false, `-p <package>` will be passed instead.
+        check_workspace: bool = "true",
 
         /// Toggles the additional completions that automatically add imports when completed.
         /// Note that your client must specify the `additionalTextEdits` LSP client capability to truly have this feature enabled.
@@ -275,6 +291,8 @@ config_data! {
                 "scope": "expr"
             }
         }"#,
+        /// Whether to enable term search based snippets like `Some(foo.bar().baz())`.
+        completion_termSearch_enable: bool = "false",
 
         /// List of rust-analyzer diagnostics to disable.
         diagnostics_disabled: FxHashSet<String> = "[]",
@@ -470,6 +488,9 @@ config_data! {
         /// Whether to show `can't find Cargo.toml` error message.
         notifications_cargoTomlNotFound: bool      = "true",
 
+        /// Whether to send an UnindexedProject notification to the client.
+        notifications_unindexedProject: bool      = "false",
+
         /// How many worker threads in the main loop. The default `null` means to pick automatically.
         numThreads: Option<usize> = "null",
 
@@ -486,6 +507,10 @@ config_data! {
 
         /// Exclude imports from find-all-references.
         references_excludeImports: bool = "false",
+
+        /// Exclude tests from find-all-references.
+        references_excludeTests: bool = "false",
+
 
         /// Command to be executed instead of 'cargo' for runnables.
         runnables_command: Option<String> = "null",
@@ -730,6 +755,7 @@ pub enum FilesWatcher {
 #[derive(Debug, Clone)]
 pub struct NotificationsConfig {
     pub cargo_toml_not_found: bool,
+    pub unindexed_project: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -882,7 +908,7 @@ impl Config {
         use serde::de::Error;
         if self.data.check_command.is_empty() {
             error_sink.push((
-                "/check/command".to_string(),
+                "/check/command".to_owned(),
                 serde_json::Error::custom("expected a non-empty string"),
             ));
         }
@@ -1172,15 +1198,15 @@ impl Config {
     }
 
     pub fn lru_query_capacities(&self) -> Option<&FxHashMap<Box<str>, usize>> {
-        self.data.lru_query_capacities.is_empty().not().then(|| &self.data.lru_query_capacities)
+        self.data.lru_query_capacities.is_empty().not().then_some(&self.data.lru_query_capacities)
     }
 
     pub fn proc_macro_srv(&self) -> Option<AbsPathBuf> {
         let path = self.data.procMacro_server.clone()?;
-        Some(AbsPathBuf::try_from(path).unwrap_or_else(|path| self.root_path.join(&path)))
+        Some(AbsPathBuf::try_from(path).unwrap_or_else(|path| self.root_path.join(path)))
     }
 
-    pub fn dummy_replacements(&self) -> &FxHashMap<Box<str>, Box<[Box<str>]>> {
+    pub fn ignored_proc_macros(&self) -> &FxHashMap<Box<str>, Box<[Box<str>]>> {
         &self.data.procMacro_ignored
     }
 
@@ -1205,7 +1231,10 @@ impl Config {
     }
 
     pub fn notifications(&self) -> NotificationsConfig {
-        NotificationsConfig { cargo_toml_not_found: self.data.notifications_cargoTomlNotFound }
+        NotificationsConfig {
+            cargo_toml_not_found: self.data.notifications_cargoTomlNotFound,
+            unindexed_project: self.data.notifications_unindexedProject,
+        }
     }
 
     pub fn cargo_autoreload(&self) -> bool {
@@ -1233,6 +1262,7 @@ impl Config {
         });
         let sysroot_src =
             self.data.cargo_sysrootSrc.as_ref().map(|sysroot| self.root_path.join(sysroot));
+        let sysroot_query_metadata = self.data.cargo_sysrootQueryMetadata;
 
         CargoConfig {
             features: match &self.data.cargo_features {
@@ -1244,6 +1274,7 @@ impl Config {
             },
             target: self.data.cargo_target.clone(),
             sysroot,
+            sysroot_query_metadata,
             sysroot_src,
             rustc_source,
             cfg_overrides: project_model::CfgOverrides {
@@ -1304,6 +1335,10 @@ impl Config {
                 enable_range_formatting: self.data.rustfmt_rangeFormatting_enable,
             },
         }
+    }
+
+    pub fn flycheck_workspace(&self) -> bool {
+        self.data.check_workspace
     }
 
     pub fn flycheck(&self) -> FlycheckConfig {
@@ -1484,6 +1519,7 @@ impl Config {
                 ImportGranularityDef::Item => ImportGranularity::Item,
                 ImportGranularityDef::Crate => ImportGranularity::Crate,
                 ImportGranularityDef::Module => ImportGranularity::Module,
+                ImportGranularityDef::One => ImportGranularity::One,
             },
             enforce_granularity: self.data.imports_granularity_enforce,
             prefix_kind: match self.data.imports_prefix {
@@ -1503,6 +1539,7 @@ impl Config {
                 && completion_item_edit_resolve(&self.caps),
             enable_self_on_the_fly: self.data.completion_autoself_enable,
             enable_private_editable: self.data.completion_privateEditable_enable,
+            enable_term_search: self.data.completion_termSearch_enable,
             full_function_signatures: self.data.completion_fullFunctionSignatures_enable,
             callable: match self.data.completion_callable_snippets {
                 CallableCompletionDef::FillArguments => Some(CallableSnippets::FillArguments),
@@ -1529,6 +1566,10 @@ impl Config {
 
     pub fn find_all_refs_exclude_imports(&self) -> bool {
         self.data.references_excludeImports
+    }
+
+    pub fn find_all_refs_exclude_tests(&self) -> bool {
+        self.data.references_excludeTests
     }
 
     pub fn snippet_cap(&self) -> bool {
@@ -1723,7 +1764,7 @@ impl Config {
     }
 
     pub fn main_loop_num_threads(&self) -> usize {
-        self.data.numThreads.unwrap_or(num_cpus::get_physical().try_into().unwrap_or(1))
+        self.data.numThreads.unwrap_or(num_cpus::get_physical())
     }
 
     pub fn typing_autoclose_angle(&self) -> bool {
@@ -1845,16 +1886,12 @@ mod de_unit_v {
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 enum SnippetScopeDef {
+    #[default]
     Expr,
     Item,
     Type,
-}
-
-impl Default for SnippetScopeDef {
-    fn default() -> Self {
-        SnippetScopeDef::Expr
-    }
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -1924,6 +1961,7 @@ enum ImportGranularityDef {
     Item,
     Crate,
     Module,
+    One,
 }
 
 #[derive(Deserialize, Debug, Copy, Clone)]
@@ -2265,12 +2303,13 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
         },
         "ImportGranularityDef" => set! {
             "type": "string",
-            "enum": ["preserve", "crate", "module", "item"],
+            "enum": ["preserve", "crate", "module", "item", "one"],
             "enumDescriptions": [
                 "Do not change the granularity of any imports and preserve the original structure written by the developer.",
                 "Merge imports from the same crate into a single use statement. Conversely, imports from different crates are split into separate statements.",
                 "Merge imports from the same module into a single use statement. Conversely, imports from different modules are split into separate statements.",
-                "Flatten imports so that each has its own use statement."
+                "Flatten imports so that each has its own use statement.",
+                "Merge all imports into a single use statement as long as they have the same visibility and attributes."
             ],
         },
         "ImportPrefixDef" => set! {
@@ -2540,14 +2579,13 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
 
 #[cfg(test)]
 fn manual(fields: &[(&'static str, &'static str, &[&str], &str)]) -> String {
-    fields
-        .iter()
-        .map(|(field, _ty, doc, default)| {
-            let name = format!("rust-analyzer.{}", field.replace('_', "."));
-            let doc = doc_comment_to_string(doc);
-            if default.contains('\n') {
-                format!(
-                    r#"[[{name}]]{name}::
+    fields.iter().fold(String::new(), |mut acc, (field, _ty, doc, default)| {
+        let name = format!("rust-analyzer.{}", field.replace('_', "."));
+        let doc = doc_comment_to_string(doc);
+        if default.contains('\n') {
+            format_to_acc!(
+                acc,
+                r#"[[{name}]]{name}::
 +
 --
 Default:
@@ -2557,16 +2595,17 @@ Default:
 {doc}
 --
 "#
-                )
-            } else {
-                format!("[[{name}]]{name} (default: `{default}`)::\n+\n--\n{doc}--\n")
-            }
-        })
-        .collect::<String>()
+            )
+        } else {
+            format_to_acc!(acc, "[[{name}]]{name} (default: `{default}`)::\n+\n--\n{doc}--\n")
+        }
+    })
 }
 
 fn doc_comment_to_string(doc: &[&str]) -> String {
-    doc.iter().map(|it| it.strip_prefix(' ').unwrap_or(it)).map(|it| format!("{it}\n")).collect()
+    doc.iter()
+        .map(|it| it.strip_prefix(' ').unwrap_or(it))
+        .fold(String::new(), |mut acc, it| format_to_acc!(acc, "{it}\n"))
 }
 
 #[cfg(test)]
@@ -2588,7 +2627,7 @@ mod tests {
             .replace('\n', "\n            ")
             .trim_start_matches('\n')
             .trim_end()
-            .to_string();
+            .to_owned();
         schema.push_str(",\n");
 
         // Transform the asciidoc form link to markdown style.
@@ -2708,7 +2747,7 @@ mod tests {
             .unwrap();
         assert_eq!(config.data.rust_analyzerTargetDir, None);
         assert!(
-            matches!(config.flycheck(), FlycheckConfig::CargoCommand { target_dir, .. } if target_dir == None)
+            matches!(config.flycheck(), FlycheckConfig::CargoCommand { target_dir, .. } if target_dir.is_none())
         );
     }
 

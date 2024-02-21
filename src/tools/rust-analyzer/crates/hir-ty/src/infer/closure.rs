@@ -21,20 +21,20 @@ use smallvec::SmallVec;
 use stdx::never;
 
 use crate::{
-    db::HirDatabase,
+    db::{HirDatabase, InternedClosure},
     from_placeholder_idx, make_binders,
     mir::{BorrowKind, MirSpan, ProjectionElem},
     static_lifetime, to_chalk_trait_id,
     traits::FnTrait,
     utils::{self, generics, Generics},
-    Adjust, Adjustment, Binders, BindingMode, ChalkTraitId, ClosureId, DynTy, FnPointer, FnSig,
-    Interner, Substitution, Ty, TyExt,
+    Adjust, Adjustment, Binders, BindingMode, ChalkTraitId, ClosureId, DynTy, FnAbi, FnPointer,
+    FnSig, Interner, Substitution, Ty, TyExt,
 };
 
 use super::{Expectation, InferenceContext};
 
 impl InferenceContext<'_> {
-    // This function handles both closures and generators.
+    // This function handles both closures and coroutines.
     pub(super) fn deduce_closure_type_from_expectations(
         &mut self,
         closure_expr: ExprId,
@@ -50,8 +50,8 @@ impl InferenceContext<'_> {
         // Deduction from where-clauses in scope, as well as fn-pointer coercion are handled here.
         let _ = self.coerce(Some(closure_expr), closure_ty, &expected_ty);
 
-        // Generators are not Fn* so return early.
-        if matches!(closure_ty.kind(Interner), TyKind::Generator(..)) {
+        // Coroutines are not Fn* so return early.
+        if matches!(closure_ty.kind(Interner), TyKind::Coroutine(..)) {
             return;
         }
 
@@ -98,7 +98,11 @@ impl InferenceContext<'_> {
                     cov_mark::hit!(dyn_fn_param_informs_call_site_closure_signature);
                     return Some(FnPointer {
                         num_binders: bound.len(Interner),
-                        sig: FnSig { abi: (), safety: chalk_ir::Safety::Safe, variadic: false },
+                        sig: FnSig {
+                            abi: FnAbi::RustCall,
+                            safety: chalk_ir::Safety::Safe,
+                            variadic: false,
+                        },
                         substitution: FnSubst(Substitution::from_iter(Interner, sig_tys)),
                     });
                 }
@@ -138,13 +142,10 @@ impl HirPlace {
         mut current_capture: CaptureKind,
         len: usize,
     ) -> CaptureKind {
-        match current_capture {
-            CaptureKind::ByRef(BorrowKind::Mut { .. }) => {
-                if self.projections[len..].iter().any(|it| *it == ProjectionElem::Deref) {
-                    current_capture = CaptureKind::ByRef(BorrowKind::Unique);
-                }
+        if let CaptureKind::ByRef(BorrowKind::Mut { .. }) = current_capture {
+            if self.projections[len..].iter().any(|it| *it == ProjectionElem::Deref) {
+                current_capture = CaptureKind::ByRef(BorrowKind::Unique);
             }
-            _ => (),
         }
         current_capture
     }
@@ -193,17 +194,15 @@ impl CapturedItem {
                     }
                     let variant_data = f.parent.variant_data(db.upcast());
                     let field = match &*variant_data {
-                        VariantData::Record(fields) => fields[f.local_id]
-                            .name
-                            .as_str()
-                            .unwrap_or("[missing field]")
-                            .to_string(),
+                        VariantData::Record(fields) => {
+                            fields[f.local_id].name.as_str().unwrap_or("[missing field]").to_owned()
+                        }
                         VariantData::Tuple(fields) => fields
                             .iter()
                             .position(|it| it.0 == f.local_id)
                             .unwrap_or_default()
                             .to_string(),
-                        VariantData::Unit => "[missing field]".to_string(),
+                        VariantData::Unit => "[missing field]".to_owned(),
                     };
                     result = format!("{result}.{field}");
                     field_need_paren = false;
@@ -330,12 +329,10 @@ impl InferenceContext<'_> {
         match &self.body[tgt_expr] {
             Expr::Path(p) => {
                 let resolver = resolver_for_expr(self.db.upcast(), self.owner, tgt_expr);
-                if let Some(r) = resolver.resolve_path_in_value_ns(self.db.upcast(), p) {
-                    if let ResolveValueResult::ValueNs(v, _) = r {
-                        if let ValueNs::LocalBinding(b) = v {
-                            return Some(HirPlace { local: b, projections: vec![] });
-                        }
-                    }
+                if let Some(ResolveValueResult::ValueNs(ValueNs::LocalBinding(b), _)) =
+                    resolver.resolve_path_in_value_ns(self.db.upcast(), p)
+                {
+                    return Some(HirPlace { local: b, projections: vec![] });
                 }
             }
             Expr::Field { expr, name: _ } => {
@@ -488,6 +485,7 @@ impl InferenceContext<'_> {
                         Statement::Expr { expr, has_semi: _ } => {
                             self.consume_expr(*expr);
                         }
+                        Statement::Item => (),
                     }
                 }
                 if let Some(tail) = tail {
@@ -533,6 +531,9 @@ impl InferenceContext<'_> {
                 if let &Some(expr) = expr {
                     self.consume_expr(expr);
                 }
+            }
+            &Expr::Become { expr } => {
+                self.consume_expr(expr);
             }
             Expr::RecordLit { fields, spread, .. } => {
                 if let &Some(expr) = spread {
@@ -666,7 +667,7 @@ impl InferenceContext<'_> {
             | Pat::Or(_) => (),
             Pat::TupleStruct { .. } | Pat::Record { .. } => {
                 if let Some(variant) = self.result.variant_resolution_for_pat(p) {
-                    let adt = variant.adt_id();
+                    let adt = variant.adt_id(self.db.upcast());
                     let is_multivariant = match adt {
                         hir_def::AdtId::EnumId(e) => self.db.enum_data(e).variants.len() != 1,
                         _ => false,
@@ -719,7 +720,7 @@ impl InferenceContext<'_> {
 
     fn is_upvar(&self, place: &HirPlace) -> bool {
         if let Some(c) = self.current_closure {
-            let (_, root) = self.db.lookup_intern_closure(c.into());
+            let InternedClosure(_, root) = self.db.lookup_intern_closure(c.into());
             return self.body.is_binding_upvar(place.local, root);
         }
         false
@@ -815,8 +816,7 @@ impl InferenceContext<'_> {
             .iter()
             .cloned()
             .chain((0..cnt).map(|_| ProjectionElem::Deref))
-            .collect::<Vec<_>>()
-            .into();
+            .collect::<Vec<_>>();
         match &self.body[pat] {
             Pat::Missing | Pat::Wild => (),
             Pat::Tuple { args, ellipsis } => {
@@ -858,7 +858,7 @@ impl InferenceContext<'_> {
                             };
                             let mut p = place.clone();
                             p.projections.push(ProjectionElem::Field(Either::Left(FieldId {
-                                parent: variant.into(),
+                                parent: variant,
                                 local_id,
                             })));
                             self.consume_with_pat(p, arg);
@@ -902,7 +902,7 @@ impl InferenceContext<'_> {
                         for (arg, (i, _)) in it {
                             let mut p = place.clone();
                             p.projections.push(ProjectionElem::Field(Either::Left(FieldId {
-                                parent: variant.into(),
+                                parent: variant,
                                 local_id: i,
                             })));
                             self.consume_with_pat(p, *arg);
@@ -942,7 +942,7 @@ impl InferenceContext<'_> {
     }
 
     fn analyze_closure(&mut self, closure: ClosureId) -> FnTrait {
-        let (_, root) = self.db.lookup_intern_closure(closure.into());
+        let InternedClosure(_, root) = self.db.lookup_intern_closure(closure.into());
         self.current_closure = Some(closure);
         let Expr::Closure { body, capture_by, .. } = &self.body[root] else {
             unreachable!("Closure expression id is always closure");
@@ -1007,7 +1007,7 @@ impl InferenceContext<'_> {
         let mut deferred_closures = mem::take(&mut self.deferred_closures);
         let mut dependents_count: FxHashMap<ClosureId, usize> =
             deferred_closures.keys().map(|it| (*it, 0)).collect();
-        for (_, deps) in &self.closure_dependencies {
+        for deps in self.closure_dependencies.values() {
             for dep in deps {
                 *dependents_count.entry(*dep).or_default() += 1;
             }

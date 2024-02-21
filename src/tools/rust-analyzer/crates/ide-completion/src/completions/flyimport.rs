@@ -207,11 +207,10 @@ fn import_on_the_fly(
     position: SyntaxNode,
     potential_import_name: String,
 ) -> Option<()> {
-    let _p = profile::span("import_on_the_fly").detail(|| potential_import_name.clone());
+    let _p =
+        tracing::span!(tracing::Level::INFO, "import_on_the_fly", ?potential_import_name).entered();
 
-    if ImportScope::find_insert_use_container(&position, &ctx.sema).is_none() {
-        return None;
-    }
+    ImportScope::find_insert_use_container(&position, &ctx.sema)?;
 
     let ns_filter = |import: &LocatedImport| {
         match (kind, import.original_item) {
@@ -239,6 +238,8 @@ fn import_on_the_fly(
             (PathKind::Type { location }, ItemInNs::Types(ty)) => {
                 if matches!(location, TypeLocation::TypeBound) {
                     matches!(ty, ModuleDef::Trait(_))
+                } else if matches!(location, TypeLocation::ImplTrait) {
+                    matches!(ty, ModuleDef::Trait(_) | ModuleDef::Module(_))
                 } else {
                     true
                 }
@@ -295,11 +296,10 @@ fn import_on_the_fly_pat_(
     position: SyntaxNode,
     potential_import_name: String,
 ) -> Option<()> {
-    let _p = profile::span("import_on_the_fly_pat").detail(|| potential_import_name.clone());
+    let _p = tracing::span!(tracing::Level::INFO, "import_on_the_fly_pat", ?potential_import_name)
+        .entered();
 
-    if ImportScope::find_insert_use_container(&position, &ctx.sema).is_none() {
-        return None;
-    }
+    ImportScope::find_insert_use_container(&position, &ctx.sema)?;
 
     let ns_filter = |import: &LocatedImport| match import.original_item {
         ItemInNs::Macros(mac) => mac.is_fn_like(ctx.db),
@@ -347,11 +347,11 @@ fn import_on_the_fly_method(
     position: SyntaxNode,
     potential_import_name: String,
 ) -> Option<()> {
-    let _p = profile::span("import_on_the_fly_method").detail(|| potential_import_name.clone());
+    let _p =
+        tracing::span!(tracing::Level::INFO, "import_on_the_fly_method", ?potential_import_name)
+            .entered();
 
-    if ImportScope::find_insert_use_container(&position, &ctx.sema).is_none() {
-        return None;
-    }
+    ImportScope::find_insert_use_container(&position, &ctx.sema)?;
 
     let user_input_lowercased = potential_import_name.to_lowercase();
 
@@ -375,11 +375,10 @@ fn import_on_the_fly_method(
             };
             key(&a.import_path).cmp(&key(&b.import_path))
         })
-        .for_each(|import| match import.original_item {
-            ItemInNs::Values(hir::ModuleDef::Function(f)) => {
+        .for_each(|import| {
+            if let ItemInNs::Values(hir::ModuleDef::Function(f)) = import.original_item {
                 acc.add_method_with_import(ctx, dot_access, f, import);
             }
-            _ => (),
         });
     Some(())
 }
@@ -398,6 +397,14 @@ fn import_assets_for_path(
     potential_import_name: &str,
     qualifier: Option<ast::Path>,
 ) -> Option<ImportAssets> {
+    let _p = tracing::span!(
+        tracing::Level::INFO,
+        "import_assets_for_path",
+        ?potential_import_name,
+        ?qualifier
+    )
+    .entered();
+
     let fuzzy_name_length = potential_import_name.len();
     let mut assets_for_path = ImportAssets::for_fuzzy_path(
         ctx.module,

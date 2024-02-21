@@ -2,7 +2,7 @@ use crate::astconv::{GenericArgCountMismatch, GenericArgCountResult, OnlySelfBou
 use crate::bounds::Bounds;
 use crate::errors::TraitObjectDeclaredWithNoTraits;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
-use rustc_errors::struct_span_code_err;
+use rustc_errors::{codes::*, struct_span_code_err};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
@@ -22,7 +22,7 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
         &self,
         span: Span,
         hir_id: hir::HirId,
-        hir_trait_bounds: &[hir::PolyTraitRef<'_>],
+        hir_trait_bounds: &[hir::PolyTraitRef<'tcx>],
         lifetime: &hir::Lifetime,
         borrowed: bool,
         representation: DynKind,
@@ -175,7 +175,7 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
                     }
                     ty::PredicateKind::Clause(ty::ClauseKind::Projection(pred)) => {
                         let pred = bound_predicate.rebind(pred);
-                        // A `Self` within the original bound will be substituted with a
+                        // A `Self` within the original bound will be instantiated with a
                         // `trait_object_dummy_self`, so check for that.
                         let references_self = match pred.skip_binder().term.unpack() {
                             ty::TermKind::Ty(ty) => ty.walk().any(|arg| arg == dummy_self.into()),
@@ -218,9 +218,10 @@ impl<'o, 'tcx> dyn AstConv<'tcx> + 'o {
         for def_ids in associated_types.values_mut() {
             for (projection_bound, span) in &projection_bounds {
                 let def_id = projection_bound.projection_def_id();
-                def_ids.remove(&def_id);
+                // FIXME(#120456) - is `swap_remove` correct?
+                def_ids.swap_remove(&def_id);
                 if tcx.generics_require_sized_self(def_id) {
-                    tcx.emit_spanned_lint(
+                    tcx.emit_node_span_lint(
                         UNUSED_ASSOCIATED_TYPE_BOUNDS,
                         hir_id,
                         *span,

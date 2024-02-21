@@ -11,8 +11,6 @@ pub mod weak;
 pub mod alloc;
 pub mod android;
 pub mod args;
-#[path = "../unix/cmath.rs"]
-pub mod cmath;
 pub mod env;
 pub mod fd;
 pub mod fs;
@@ -22,15 +20,12 @@ pub mod io;
 pub mod kernel_copy;
 #[cfg(target_os = "l4re")]
 mod l4re;
-pub mod locks;
 pub mod memchr;
 #[cfg(not(target_os = "l4re"))]
 pub mod net;
 #[cfg(target_os = "l4re")]
 pub use self::l4re::net;
 pub mod os;
-pub mod os_str;
-pub mod path;
 pub mod pipe;
 pub mod process;
 pub mod rand;

@@ -55,24 +55,24 @@ This API is completely unstable and subject to change.
 
 */
 
+#![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::potential_query_instability)]
+#![allow(rustc::untranslatable_diagnostic)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
 #![feature(rustdoc_internals)]
 #![allow(internal_features)]
-#![feature(box_patterns)]
 #![feature(control_flow_enum)]
+#![feature(generic_nonzero)]
 #![feature(if_let_guard)]
 #![feature(is_sorted)]
 #![feature(iter_intersperse)]
 #![feature(let_chains)]
-#![feature(min_specialization)]
+#![cfg_attr(bootstrap, feature(min_specialization))]
 #![feature(never_type)]
 #![feature(lazy_cell)]
 #![feature(slice_partition_dedup)]
 #![feature(try_blocks)]
-#![feature(type_alias_impl_trait)]
-#![recursion_limit = "256"]
 
 #[macro_use]
 extern crate tracing;
@@ -166,42 +166,48 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorGuaranteed> {
         tcx.hir().for_each_module(|module| tcx.ensure().collect_mod_item_types(module))
     });
 
-    // FIXME(matthewjasper) We shouldn't need to use `track_errors` anywhere in this function
-    // or the compiler in general.
     if tcx.features().rustc_attrs {
-        tcx.sess.track_errors(|| {
-            tcx.sess.time("outlives_testing", || outlives::test::test_inferred_outlives(tcx));
-        })?;
+        tcx.sess.time("outlives_testing", || outlives::test::test_inferred_outlives(tcx))?;
     }
 
-    tcx.sess.track_errors(|| {
-        tcx.sess.time("coherence_checking", || {
-            // Check impls constrain their parameters
-            tcx.hir().for_each_module(|module| tcx.ensure().check_mod_impl_wf(module));
+    tcx.sess.time("coherence_checking", || {
+        // Check impls constrain their parameters
+        let res =
+            tcx.hir().try_par_for_each_module(|module| tcx.ensure().check_mod_impl_wf(module));
 
-            for &trait_def_id in tcx.all_local_trait_impls(()).keys() {
-                tcx.ensure().coherent_trait(trait_def_id);
-            }
-
-            // these queries are executed for side-effects (error reporting):
-            tcx.ensure().crate_inherent_impls(());
-            tcx.ensure().crate_inherent_impls_overlap_check(());
-        });
+        for &trait_def_id in tcx.all_local_trait_impls(()).keys() {
+            let _ = tcx.ensure().coherent_trait(trait_def_id);
+        }
+        // these queries are executed for side-effects (error reporting):
+        let _ = tcx.ensure().crate_inherent_impls(());
+        let _ = tcx.ensure().crate_inherent_impls_overlap_check(());
+        res
     })?;
 
     if tcx.features().rustc_attrs {
-        tcx.sess.track_errors(|| {
-            tcx.sess.time("variance_testing", || variance::test::test_variance(tcx));
-        })?;
+        tcx.sess.time("variance_testing", || variance::test::test_variance(tcx))?;
     }
 
     tcx.sess.time("wf_checking", || {
-        tcx.hir().try_par_for_each_module(|module| tcx.ensure().check_mod_type_wf(module))
-    })?;
+        tcx.hir().par_for_each_module(|module| {
+            let _ = tcx.ensure().check_mod_type_wf(module);
+        })
+    });
 
     if tcx.features().rustc_attrs {
-        tcx.sess.track_errors(|| collect::test_opaque_hidden_types(tcx))?;
+        collect::test_opaque_hidden_types(tcx)?;
     }
+
+    // Make sure we evaluate all static and (non-associated) const items, even if unused.
+    // If any of these fail to evaluate, we do not want this crate to pass compilation.
+    tcx.hir().par_body_owners(|item_def_id| {
+        let def_kind = tcx.def_kind(item_def_id);
+        match def_kind {
+            DefKind::Static(_) => tcx.ensure().eval_static_initializer(item_def_id),
+            DefKind::Const => tcx.ensure().const_eval_poly(item_def_id.into()),
+            _ => (),
+        }
+    });
 
     // Freeze definitions as we don't add new ones at this point. This improves performance by
     // allowing lock-free access to them.
@@ -220,12 +226,12 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorGuaranteed> {
 
     tcx.ensure().check_unused_traits(());
 
-    if let Some(reported) = tcx.dcx().has_errors() { Err(reported) } else { Ok(()) }
+    Ok(())
 }
 
 /// A quasi-deprecated helper used in rustdoc and clippy to get
 /// the type from a HIR node.
-pub fn hir_ty_to_ty<'tcx>(tcx: TyCtxt<'tcx>, hir_ty: &hir::Ty<'_>) -> Ty<'tcx> {
+pub fn hir_ty_to_ty<'tcx>(tcx: TyCtxt<'tcx>, hir_ty: &hir::Ty<'tcx>) -> Ty<'tcx> {
     // In case there are any projections, etc., find the "environment"
     // def-ID that will be used to determine the traits/predicates in
     // scope. This is derived from the enclosing item-like thing.
@@ -236,7 +242,7 @@ pub fn hir_ty_to_ty<'tcx>(tcx: TyCtxt<'tcx>, hir_ty: &hir::Ty<'_>) -> Ty<'tcx> {
 
 pub fn hir_trait_to_predicates<'tcx>(
     tcx: TyCtxt<'tcx>,
-    hir_trait: &hir::TraitRef<'_>,
+    hir_trait: &hir::TraitRef<'tcx>,
     self_ty: Ty<'tcx>,
 ) -> Bounds<'tcx> {
     // In case there are any projections, etc., find the "environment"

@@ -25,15 +25,13 @@ use rustc_ast::{Arm, BlockCheckMode, Expr, ExprKind, Label, Movability, RangeLim
 use rustc_ast::{ClosureBinder, MetaItemLit, StmtKind};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::stack::ensure_sufficient_stack;
-use rustc_errors::{
-    AddToDiagnostic, Applicability, Diagnostic, DiagnosticBuilder, PResult, StashKey,
-};
+use rustc_errors::{AddToDiagnostic, Applicability, DiagnosticBuilder, PResult, StashKey};
+use rustc_lexer::unescape::unescape_char;
 use rustc_macros::Subdiagnostic;
 use rustc_session::errors::{report_lit_error, ExprParenthesesNeeded};
 use rustc_session::lint::builtin::BREAK_WITH_LABEL_AND_LOOP;
 use rustc_session::lint::BuiltinLintDiagnostics;
 use rustc_span::source_map::{self, Spanned};
-use rustc_span::symbol::kw::PathRoot;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{BytePos, Pos, Span};
 use thin_vec::{thin_vec, ThinVec};
@@ -445,6 +443,19 @@ impl<'a> Parser<'a> {
             ) if self.restrictions.contains(Restrictions::CONST_EXPR) => {
                 return None;
             }
+            // When recovering patterns as expressions, stop parsing when encountering an assignment `=`, an alternative `|`, or a range `..`.
+            (
+                Some(
+                    AssocOp::Assign
+                    | AssocOp::AssignOp(_)
+                    | AssocOp::BitOr
+                    | AssocOp::DotDot
+                    | AssocOp::DotDotEq,
+                ),
+                _,
+            ) if self.restrictions.contains(Restrictions::IS_PAT) => {
+                return None;
+            }
             (Some(op), _) => (op, self.token.span),
             (None, Some((Ident { name: sym::and, span }, false))) if self.may_recover() => {
                 self.dcx().emit_err(errors::InvalidLogicalOperator {
@@ -483,7 +494,11 @@ impl<'a> Parser<'a> {
         cur_op_span: Span,
     ) -> PResult<'a, P<Expr>> {
         let rhs = if self.is_at_start_of_range_notation_rhs() {
-            Some(self.parse_expr_assoc_with(prec + 1, LhsExpr::NotYetParsed)?)
+            let maybe_lt = self.token.clone();
+            Some(
+                self.parse_expr_assoc_with(prec + 1, LhsExpr::NotYetParsed)
+                    .map_err(|err| self.maybe_err_dotdotlt_syntax(maybe_lt, err))?,
+            )
         } else {
             None
         };
@@ -532,11 +547,13 @@ impl<'a> Parser<'a> {
         let attrs = self.parse_or_use_outer_attributes(attrs)?;
         self.collect_tokens_for_expr(attrs, |this, attrs| {
             let lo = this.token.span;
+            let maybe_lt = this.look_ahead(1, |t| t.clone());
             this.bump();
             let (span, opt_end) = if this.is_at_start_of_range_notation_rhs() {
                 // RHS must be parsed with more associativity than the dots.
                 this.parse_expr_assoc_with(op.unwrap().precedence() + 1, LhsExpr::NotYetParsed)
-                    .map(|x| (lo.to(x.span), Some(x)))?
+                    .map(|x| (lo.to(x.span), Some(x)))
+                    .map_err(|err| this.maybe_err_dotdotlt_syntax(maybe_lt, err))?
             } else {
                 (lo, None)
             };
@@ -642,26 +659,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse `box expr` - this syntax has been removed, but we still parse this
-    /// for now to provide an automated way to fix usages of it
-    fn parse_expr_box(&mut self, lo: Span) -> PResult<'a, (Span, ExprKind)> {
-        let (span, expr) = self.parse_expr_prefix_common(lo)?;
-        let code = self.sess.source_map().span_to_snippet(span.with_lo(lo.hi())).unwrap();
-        self.dcx().emit_err(errors::BoxSyntaxRemoved { span, code: code.trim() });
-        // So typechecking works, parse `box <expr>` as `::std::boxed::Box::new(expr)`
-        let path = Path {
-            span,
-            segments: [
-                PathSegment::from_ident(Ident::with_dummy_span(PathRoot)),
-                PathSegment::from_ident(Ident::with_dummy_span(sym::std)),
-                PathSegment::from_ident(Ident::from_str("boxed")),
-                PathSegment::from_ident(Ident::from_str("Box")),
-                PathSegment::from_ident(Ident::with_dummy_span(sym::new)),
-            ]
-            .into(),
-            tokens: None,
-        };
-        let path = self.mk_expr(span, ExprKind::Path(None, path));
-        Ok((span, self.mk_call(path, ThinVec::from([expr]))))
+    /// for now to provide a more useful error
+    fn parse_expr_box(&mut self, box_kw: Span) -> PResult<'a, (Span, ExprKind)> {
+        let (span, _) = self.parse_expr_prefix_common(box_kw)?;
+        let inner_span = span.with_lo(box_kw.hi());
+        let code = self.sess.source_map().span_to_snippet(inner_span).unwrap();
+        self.dcx().emit_err(errors::BoxSyntaxRemoved { span: span, code: code.trim() });
+        Ok((span, ExprKind::Err))
     }
 
     fn is_mistaken_not_ident_negation(&self) -> bool {
@@ -859,7 +863,7 @@ impl<'a> Parser<'a> {
             );
             let mut err = self.dcx().struct_span_err(span, msg);
 
-            let suggest_parens = |err: &mut Diagnostic| {
+            let suggest_parens = |err: &mut DiagnosticBuilder<'_>| {
                 let suggestions = vec![
                     (span.shrink_to_lo(), "(".to_string()),
                     (span.shrink_to_hi(), ")".to_string()),
@@ -1427,7 +1431,7 @@ impl<'a> Parser<'a> {
                     // If the input is something like `if a { 1 } else { 2 } | if a { 3 } else { 4 }`
                     // then suggest parens around the lhs.
                     if let Some(sp) = this.sess.ambiguous_block_expr_parse.borrow().get(&lo) {
-                        err.subdiagnostic(ExprParenthesesNeeded::surrounding(*sp));
+                        err.subdiagnostic(this.dcx(), ExprParenthesesNeeded::surrounding(*sp));
                     }
                     err
                 })
@@ -1660,6 +1664,7 @@ impl<'a> Parser<'a> {
             && self.may_recover()
             && (matches!(self.token.kind, token::CloseDelim(_) | token::Comma)
                 || self.token.is_punct())
+            && could_be_unclosed_char_literal(label_.ident)
         {
             let (lit, _) =
                 self.recover_unclosed_char(label_.ident, Parser::mk_token_lit_char, |self_| {
@@ -1745,16 +1750,17 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    /// Emit an error when a char is parsed as a lifetime because of a missing quote.
+    /// Emit an error when a char is parsed as a lifetime or label because of a missing quote.
     pub(super) fn recover_unclosed_char<L>(
         &self,
-        lifetime: Ident,
+        ident: Ident,
         mk_lit_char: impl FnOnce(Symbol, Span) -> L,
         err: impl FnOnce(&Self) -> DiagnosticBuilder<'a>,
     ) -> L {
-        if let Some(diag) = self.dcx().steal_diagnostic(lifetime.span, StashKey::LifetimeIsChar) {
+        assert!(could_be_unclosed_char_literal(ident));
+        if let Some(diag) = self.dcx().steal_diagnostic(ident.span, StashKey::LifetimeIsChar) {
             diag.with_span_suggestion_verbose(
-                lifetime.span.shrink_to_hi(),
+                ident.span.shrink_to_hi(),
                 "add `'` to close the char literal",
                 "'",
                 Applicability::MaybeIncorrect,
@@ -1763,15 +1769,15 @@ impl<'a> Parser<'a> {
         } else {
             err(self)
                 .with_span_suggestion_verbose(
-                    lifetime.span.shrink_to_hi(),
+                    ident.span.shrink_to_hi(),
                     "add `'` to close the char literal",
                     "'",
                     Applicability::MaybeIncorrect,
                 )
                 .emit();
         }
-        let name = lifetime.without_first_quote().name;
-        mk_lit_char(name, lifetime.span)
+        let name = ident.without_first_quote().name;
+        mk_lit_char(name, ident.span)
     }
 
     /// Recover on the syntax `do catch { ... }` suggesting `try { ... }` instead.
@@ -1844,7 +1850,7 @@ impl<'a> Parser<'a> {
             let lexpr = self.parse_expr_labeled(label, true)?;
             self.dcx().emit_err(errors::LabeledLoopInBreak {
                 span: lexpr.span,
-                sub: errors::WrapExpressionInParentheses {
+                sub: errors::WrapInParentheses::Expression {
                     left: lexpr.span.shrink_to_lo(),
                     right: lexpr.span.shrink_to_hi(),
                 },
@@ -2042,8 +2048,11 @@ impl<'a> Parser<'a> {
             let msg = format!("unexpected token: {}", super::token_descr(&token));
             self_.dcx().struct_span_err(token.span, msg)
         };
-        // On an error path, eagerly consider a lifetime to be an unclosed character lit
-        if self.token.is_lifetime() {
+        // On an error path, eagerly consider a lifetime to be an unclosed character lit, if that
+        // makes sense.
+        if let Some(ident) = self.token.lifetime()
+            && could_be_unclosed_char_literal(ident)
+        {
             let lt = self.expect_lifetime();
             Ok(self.recover_unclosed_char(lt.ident, mk_lit_char, err))
         } else {
@@ -2129,12 +2138,12 @@ impl<'a> Parser<'a> {
                     Err(err) => {
                         let span = token.uninterpolated_span();
                         self.bump();
-                        report_lit_error(self.sess, err, lit, span);
+                        let guar = report_lit_error(self.sess, err, lit, span);
                         // Pack possible quotes and prefixes from the original literal into
                         // the error literal's symbol so they can be pretty-printed faithfully.
                         let suffixless_lit = token::Lit::new(lit.kind, lit.symbol, None);
                         let symbol = Symbol::intern(&suffixless_lit.to_string());
-                        let lit = token::Lit::new(token::Err, symbol, lit.suffix);
+                        let lit = token::Lit::new(token::Err(guar), symbol, lit.suffix);
                         Some(
                             MetaItemLit::from_token_lit(lit, span)
                                 .unwrap_or_else(|_| unreachable!()),
@@ -2900,12 +2909,22 @@ impl<'a> Parser<'a> {
                 Ok(arm) => arms.push(arm),
                 Err(e) => {
                     // Recover by skipping to the end of the block.
-                    e.emit();
+                    let guar = e.emit();
                     self.recover_stmt();
                     let span = lo.to(self.token.span);
                     if self.token == token::CloseDelim(Delimiter::Brace) {
                         self.bump();
                     }
+                    // Always push at least one arm to make the match non-empty
+                    arms.push(Arm {
+                        attrs: Default::default(),
+                        pat: self.mk_pat(span, ast::PatKind::Err(guar)),
+                        guard: None,
+                        body: Some(self.mk_expr_err(span)),
+                        span,
+                        id: DUMMY_NODE_ID,
+                        is_placeholder: false,
+                    });
                     return Ok(self.mk_expr_with_attrs(
                         span,
                         ExprKind::Match(scrutinee, arms),
@@ -3277,7 +3296,7 @@ impl<'a> Parser<'a> {
                         } else {
                             Applicability::MaybeIncorrect
                         };
-                        err.span_suggestion_verbose(sugg_sp, msg, "=> ".to_string(), applicability);
+                        err.span_suggestion_verbose(sugg_sp, msg, "=> ", applicability);
                     }
                 }
                 err
@@ -3416,7 +3435,7 @@ impl<'a> Parser<'a> {
         let mut recover_async = false;
         let in_if_guard = self.restrictions.contains(Restrictions::IN_IF_GUARD);
 
-        let mut async_block_err = |e: &mut Diagnostic, span: Span| {
+        let mut async_block_err = |e: &mut DiagnosticBuilder<'_>, span: Span| {
             recover_async = true;
             errors::AsyncBlockIn2015 { span }.add_to_diagnostic(e);
             errors::HelpUseLatestEdition::new().add_to_diagnostic(e);
@@ -3769,6 +3788,13 @@ impl<'a> Parser<'a> {
             Ok((res, trailing))
         })
     }
+}
+
+/// Could this lifetime/label be an unclosed char literal? For example, `'a`
+/// could be, but `'abc` could not.
+pub(crate) fn could_be_unclosed_char_literal(ident: Ident) -> bool {
+    ident.name.as_str().starts_with('\'')
+        && unescape_char(ident.without_first_quote().name.as_str()).is_ok()
 }
 
 /// Used to forbid `let` expressions in certain syntactic locations.

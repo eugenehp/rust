@@ -367,6 +367,7 @@ pub fn compile_declarative_macro(
             edition,
             def.ident.name,
             &def.attrs,
+            def.id != DUMMY_NODE_ID,
         )
     };
     let dummy_syn_ext = || (mk_syn_ext(Box::new(macro_rules_dummy_expander)), Vec::new());
@@ -453,7 +454,7 @@ pub fn compile_declarative_macro(
                 let sp = token.span.substitute_dummy(def.span);
                 let mut err = sess.dcx().struct_span_err(sp, s);
                 err.span_label(sp, msg);
-                annotate_doc_comment(&mut err, sess.source_map(), sp);
+                annotate_doc_comment(sess.dcx(), &mut err, sess.source_map(), sp);
                 err.emit();
                 return dummy_syn_ext();
             }
@@ -484,7 +485,9 @@ pub fn compile_declarative_macro(
                     )
                     .pop()
                     .unwrap();
-                    valid &= check_lhs_nt_follows(sess, def, &tt);
+                    // We don't handle errors here, the driver will abort
+                    // after parsing/expansion. we can report every error in every macro this way.
+                    valid &= check_lhs_nt_follows(sess, def, &tt).is_ok();
                     return tt;
                 }
                 sess.dcx().span_bug(def.span, "wrong-structured lhs")
@@ -588,18 +591,19 @@ pub fn compile_declarative_macro(
     (mk_syn_ext(expander), rule_spans)
 }
 
-fn check_lhs_nt_follows(sess: &Session, def: &ast::Item, lhs: &mbe::TokenTree) -> bool {
+fn check_lhs_nt_follows(
+    sess: &Session,
+    def: &ast::Item,
+    lhs: &mbe::TokenTree,
+) -> Result<(), ErrorGuaranteed> {
     // lhs is going to be like TokenTree::Delimited(...), where the
     // entire lhs is those tts. Or, it can be a "bare sequence", not wrapped in parens.
     if let mbe::TokenTree::Delimited(.., delimited) = lhs {
         check_matcher(sess, def, &delimited.tts)
     } else {
         let msg = "invalid macro matcher; matchers must be contained in balanced delimiters";
-        sess.dcx().span_err(lhs.span(), msg);
-        false
+        Err(sess.dcx().span_err(lhs.span(), msg))
     }
-    // we don't abort on errors on rejection, the driver will do that for us
-    // after parsing/expansion. we can report every error in every macro this way.
 }
 
 fn is_empty_token_tree(sess: &Session, seq: &mbe::SequenceRepetition) -> bool {
@@ -674,12 +678,15 @@ fn check_rhs(sess: &Session, rhs: &mbe::TokenTree) -> bool {
     false
 }
 
-fn check_matcher(sess: &Session, def: &ast::Item, matcher: &[mbe::TokenTree]) -> bool {
+fn check_matcher(
+    sess: &Session,
+    def: &ast::Item,
+    matcher: &[mbe::TokenTree],
+) -> Result<(), ErrorGuaranteed> {
     let first_sets = FirstSets::new(matcher);
     let empty_suffix = TokenSet::empty();
-    let err = sess.dcx().err_count();
-    check_matcher_core(sess, def, &first_sets, matcher, &empty_suffix);
-    err == sess.dcx().err_count()
+    check_matcher_core(sess, def, &first_sets, matcher, &empty_suffix)?;
+    Ok(())
 }
 
 fn has_compile_error_macro(rhs: &mbe::TokenTree) -> bool {
@@ -1019,10 +1026,12 @@ fn check_matcher_core<'tt>(
     first_sets: &FirstSets<'tt>,
     matcher: &'tt [mbe::TokenTree],
     follow: &TokenSet<'tt>,
-) -> TokenSet<'tt> {
+) -> Result<TokenSet<'tt>, ErrorGuaranteed> {
     use mbe::TokenTree;
 
     let mut last = TokenSet::empty();
+
+    let mut errored = Ok(());
 
     // 2. For each token and suffix  [T, SUFFIX] in M:
     // ensure that T can be followed by SUFFIX, and if SUFFIX may be empty,
@@ -1067,7 +1076,7 @@ fn check_matcher_core<'tt>(
                     token::CloseDelim(d.delim),
                     span.close,
                 ));
-                check_matcher_core(sess, def, first_sets, &d.tts, &my_suffix);
+                check_matcher_core(sess, def, first_sets, &d.tts, &my_suffix)?;
                 // don't track non NT tokens
                 last.replace_with_irrelevant();
 
@@ -1099,7 +1108,7 @@ fn check_matcher_core<'tt>(
                 // At this point, `suffix_first` is built, and
                 // `my_suffix` is some TokenSet that we can use
                 // for checking the interior of `seq_rep`.
-                let next = check_matcher_core(sess, def, first_sets, &seq_rep.tts, my_suffix);
+                let next = check_matcher_core(sess, def, first_sets, &seq_rep.tts, my_suffix)?;
                 if next.maybe_empty {
                     last.add_all(&next);
                 } else {
@@ -1205,14 +1214,15 @@ fn check_matcher_core<'tt>(
                                     ));
                                 }
                             }
-                            err.emit();
+                            errored = Err(err.emit());
                         }
                     }
                 }
             }
         }
     }
-    last
+    errored?;
+    Ok(last)
 }
 
 fn token_can_be_followed_by_any(tok: &mbe::TokenTree) -> bool {
