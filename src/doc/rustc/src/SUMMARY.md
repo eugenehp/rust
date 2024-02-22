@@ -20,6 +20,7 @@
     - [aarch64-apple-ios-sim](platform-support/aarch64-apple-ios-sim.md)
     - [\*-apple-tvos](platform-support/apple-tvos.md)
     - [\*-apple-watchos\*](platform-support/apple-watchos.md)
+    - [aarch64-apple-xros\*](platform-support/apple-xros.md)
     - [aarch64-nintendo-switch-freestanding](platform-support/aarch64-nintendo-switch-freestanding.md)
     - [armeb-unknown-linux-gnueabi](platform-support/armeb-unknown-linux-gnueabi.md)
     - [arm-none-eabi](platform-support/arm-none-eabi.md)
