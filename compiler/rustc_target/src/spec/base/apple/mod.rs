@@ -378,6 +378,7 @@ fn xros_deployment_target() -> (u32, u32) {
     from_set_deployment_target("XROS_DEPLOYMENT_TARGET").unwrap_or((1, 0))
 }
 
+#[allow(dead_code)]
 fn xros_lld_platform_version() -> String {
     let (major, minor) = xros_deployment_target();
     format!("{major}.{minor}")
