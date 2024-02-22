@@ -14,6 +14,7 @@ use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, Owned
     target_os = "tvos",
     target_os = "macos",
     target_os = "watchos",
+    target_os = "xros",
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
@@ -34,6 +35,7 @@ use crate::time::Duration;
     target_os = "tvos",
     target_os = "macos",
     target_os = "watchos",
+    target_os = "xros",
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
@@ -243,6 +245,7 @@ impl UnixStream {
         target_os = "tvos",
         target_os = "macos",
         target_os = "watchos",
+        target_os = "xros",
         target_os = "netbsd",
         target_os = "openbsd"
     ))]

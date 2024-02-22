@@ -85,6 +85,8 @@ mod platform {
     pub use crate::os::vxworks::*;
     #[cfg(target_os = "watchos")]
     pub use crate::os::watchos::*;
+    #[cfg(target_os = "xros")]
+    pub use crate::os::xros::*;
 }
 
 pub mod ffi;
@@ -104,6 +106,7 @@ pub mod thread;
     target_os = "ios",
     target_os = "tvos",
     target_os = "watchos",
+    target_os = "xros",
     target_os = "macos",
     target_os = "netbsd",
     target_os = "openbsd",
